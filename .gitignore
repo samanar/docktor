@@ -1,0 +1,39 @@
+# Binaries
+/bin/
+/docktor
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+
+# Output of go coverage
+*.out
+coverage.html
+
+# Dependency directories
+vendor/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+plan.md

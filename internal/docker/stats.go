@@ -1,0 +1,77 @@
+package docker
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// ── Types ──────────────────────────────────────────────────────────
+
+// ContainerStats holds real-time resource usage for one container.
+type ContainerStats struct {
+	Name     string
+	CPUPerc  string // e.g. "1.23%"
+	MemUsage string // e.g. "80MiB"  (used portion only)
+	MemPerc  string // e.g. "2.45%"
+}
+
+// statsLine mirrors the JSON object emitted by
+//   docker stats --no-stream --format '{{json .}}'
+type statsLine struct {
+	Name     string `json:"Name"`
+	CPUPerc  string `json:"CPUPerc"`
+	MemUsage string `json:"MemUsage"`
+	MemPerc  string `json:"MemPerc"`
+}
+
+// ── Stats fetching ─────────────────────────────────────────────────
+
+// GetStats returns a map of container name → resource stats for all
+// running containers.  Stopped / exited containers are omitted by
+// the Docker daemon.
+func (c *Client) GetStats() (map[string]ContainerStats, error) {
+	raw, err := runDockerCLI("stats", "--no-stream",
+		"--format", `{{json .}}`)
+	if err != nil {
+		return nil, fmt.Errorf("docker stats: %w", err)
+	}
+
+	result := make(map[string]ContainerStats)
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		var sl statsLine
+		if err := json.Unmarshal([]byte(line), &sl); err != nil {
+			continue // skip malformed lines
+		}
+		// Extract just the used portion of memory ("80MiB / 1.5GiB" → "80MiB")
+		memUsed := sl.MemUsage
+		if idx := strings.Index(memUsed, " / "); idx >= 0 {
+			memUsed = memUsed[:idx]
+		}
+		result[sl.Name] = ContainerStats{
+			Name:     sl.Name,
+			CPUPerc:  sl.CPUPerc,
+			MemUsage: memUsed,
+			MemPerc:  sl.MemPerc,
+		}
+	}
+	return result, nil
+}
+
+// MergeStats copies CPU / Memory values from the stats map into the
+// matching containers in-place.  Containers not present in the map
+// keep their previous values.
+func MergeStats(groups []ContainerGroup, stats map[string]ContainerStats) {
+	for gi := range groups {
+		for ci := range groups[gi].Containers {
+			name := groups[gi].Containers[ci].Name
+			if s, ok := stats[name]; ok {
+				groups[gi].Containers[ci].CPU = s.CPUPerc
+				groups[gi].Containers[ci].Memory = s.MemUsage
+			}
+		}
+	}
+}
