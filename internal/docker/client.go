@@ -35,6 +35,40 @@ type ContainerGroup struct {
 	Containers []Container
 }
 
+// ── Network types ──────────────────────────────────────────────────
+
+// NetworkContainer describes a container attached to a Docker network.
+type NetworkContainer struct {
+	Name     string
+	IPv4Addr string
+	IPv6Addr string
+	MACAddr  string
+}
+
+// Network represents a Docker network with the fields the TUI needs
+// to display.
+type Network struct {
+	ID         string
+	Name       string
+	Driver     string // bridge, overlay, host, macvlan, etc.
+	Scope      string // local, swarm, global
+	Internal   bool
+	IPv6       bool
+	Attachable bool
+	Created    string
+	Subnet     string // primary IPAM subnet, e.g. "172.18.0.0/16"
+	Gateway    string // primary IPAM gateway, e.g. "172.18.0.1"
+	IPRange    string // primary IPAM IP range (may be empty)
+	Containers []NetworkContainer
+	Labels     map[string]string
+}
+
+// NetworkGroup is a named group of networks sharing the same driver.
+type NetworkGroup struct {
+	Driver   string
+	Networks []Network
+}
+
 // ── Client ─────────────────────────────────────────────────────────
 
 // Client wraps calls to the local Docker daemon via the `docker` CLI.
@@ -149,6 +183,117 @@ func (c *Client) RestartContainer(name string) error {
 func (c *Client) KillContainer(name string) error {
 	_, err := runDockerCLI("kill", name)
 	return err
+}
+
+// ── Network methods ─────────────────────────────────────────────
+
+// networkInspectItem mirrors a single element from the JSON array
+// returned by `docker network inspect`.
+type networkInspectItem struct {
+	ID         string `json:"Id"`
+	Name       string `json:"Name"`
+	Driver     string `json:"Driver"`
+	Scope      string `json:"Scope"`
+	Internal   bool   `json:"Internal"`
+	EnableIPv6 bool   `json:"EnableIPv6"`
+	Attachable bool   `json:"Attachable"`
+	Created    string `json:"Created"`
+	IPAM       struct {
+		Driver string `json:"Driver"`
+		Config []struct {
+			Subnet  string `json:"Subnet"`
+			Gateway string `json:"Gateway"`
+			IPRange string `json:"IPRange"`
+		} `json:"Config"`
+	} `json:"IPAM"`
+	Containers map[string]struct {
+		Name        string `json:"Name"`
+		IPv4Address string `json:"IPv4Address"`
+		IPv6Address string `json:"IPv6Address"`
+		MacAddress  string `json:"MacAddress"`
+	} `json:"Containers"`
+	Labels map[string]string `json:"Labels"`
+}
+
+// ListNetworks returns all Docker networks grouped by driver.
+func (c *Client) ListNetworks() ([]NetworkGroup, error) {
+	// Get all network IDs first
+	idsRaw, err := runDockerCLI("network", "ls", "-q")
+	if err != nil {
+		return nil, fmt.Errorf("docker network ls: %w", err)
+	}
+	idsRaw = strings.TrimSpace(idsRaw)
+	if idsRaw == "" {
+		return []NetworkGroup{}, nil
+	}
+
+	ids := strings.Fields(idsRaw)
+	args := append([]string{"network", "inspect"}, ids...)
+	raw, err := runDockerCLI(args...)
+	if err != nil {
+		return nil, fmt.Errorf("docker network inspect: %w", err)
+	}
+
+	var items []networkInspectItem
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		return nil, fmt.Errorf("parsing network inspect: %w", err)
+	}
+
+	var networks []Network
+	for _, item := range items {
+		n := Network{
+			ID:         item.ID,
+			Name:       item.Name,
+			Driver:     item.Driver,
+			Scope:      item.Scope,
+			Internal:   item.Internal,
+			IPv6:       item.EnableIPv6,
+			Attachable: item.Attachable,
+			Created:    item.Created,
+			Labels:     item.Labels,
+		}
+
+		// Extract primary IPAM config
+		if len(item.IPAM.Config) > 0 {
+			n.Subnet = item.IPAM.Config[0].Subnet
+			n.Gateway = item.IPAM.Config[0].Gateway
+			n.IPRange = item.IPAM.Config[0].IPRange
+		}
+
+		// Map containers
+		for _, ctr := range item.Containers {
+			n.Containers = append(n.Containers, NetworkContainer{
+				Name:     ctr.Name,
+				IPv4Addr: ctr.IPv4Address,
+				IPv6Addr: ctr.IPv6Address,
+				MACAddr:  ctr.MacAddress,
+			})
+		}
+
+		networks = append(networks, n)
+	}
+
+	return groupByDriver(networks), nil
+}
+
+// InspectNetworkRaw returns the raw JSON output of `docker network
+// inspect <name>` for the given network.
+func (c *Client) InspectNetworkRaw(name string) (string, error) {
+	raw, err := runDockerCLI("network", "inspect", name)
+	if err != nil {
+		return "", fmt.Errorf("docker network inspect %s: %w", name, err)
+	}
+	return raw, nil
+}
+
+// PruneNetworks removes all unused Docker networks (with -f flag)
+// and returns the command output.
+func (c *Client) PruneNetworks() (string, error) {
+	raw, err := runDockerCLI("network", "prune", "-f")
+	if err != nil {
+		return "", fmt.Errorf("docker network prune: %w", err)
+	}
+	return raw, nil
 }
 
 // ── Disk usage ───────────────────────────────────────────────────
@@ -391,6 +536,63 @@ func groupByProject(containers []Container) []ContainerGroup {
 	}
 	if hasOther {
 		result = append(result, ContainerGroup{Project: "Other", Containers: groups["Other"]})
+	}
+
+	return result
+}
+
+// groupByDriver buckets networks by driver. Built-in drivers
+// (bridge, host, none) come first; custom drivers follow
+// alphabetically.
+func groupByDriver(networks []Network) []NetworkGroup {
+	groups := map[string][]Network{}
+	var driverOrder []string
+
+	// Fixed ordering for built-in drivers
+	builtinOrder := []string{"bridge", "host", "none"}
+
+	for _, n := range networks {
+		driver := n.Driver
+		if driver == "" {
+			driver = "unknown"
+		}
+		if _, ok := groups[driver]; !ok {
+			driverOrder = append(driverOrder, driver)
+		}
+		groups[driver] = append(groups[driver], n)
+	}
+
+	// Sort: built-ins first in fixed order, then custom alphabetically
+	var result []NetworkGroup
+	for _, d := range builtinOrder {
+		if nets, ok := groups[d]; ok {
+			result = append(result, NetworkGroup{Driver: d, Networks: nets})
+		}
+	}
+	// Add remaining drivers in alphabetical order
+	var custom []string
+	for _, d := range driverOrder {
+		isBuiltin := false
+		for _, b := range builtinOrder {
+			if d == b {
+				isBuiltin = true
+				break
+			}
+		}
+		if !isBuiltin {
+			custom = append(custom, d)
+		}
+	}
+	// Simple sort
+	for i := 0; i < len(custom); i++ {
+		for j := i + 1; j < len(custom); j++ {
+			if custom[i] > custom[j] {
+				custom[i], custom[j] = custom[j], custom[i]
+			}
+		}
+	}
+	for _, d := range custom {
+		result = append(result, NetworkGroup{Driver: d, Networks: groups[d]})
 	}
 
 	return result
