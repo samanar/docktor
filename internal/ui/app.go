@@ -29,6 +29,10 @@ type AppModel struct {
 	logScrollOff  int
 	logAutoScroll bool
 	selectedName  string
+
+	// Image layer viewer state
+	imageLayers    []docker.ImageLayer
+	selectedImageID string
 }
 
 // NewApp creates the root application model with the given theme.
@@ -57,6 +61,14 @@ type logsLoadedMsg struct {
 type imageSizeLoadedMsg struct {
 	containerName string
 	imageSize     string
+}
+
+// imageLayersLoadedMsg is sent when image history (layers) has been
+// fetched.
+type imageLayersLoadedMsg struct {
+	imageID string
+	layers  []docker.ImageLayer
+	err     error
 }
 
 // ── Bubble Tea Model ─────────────────────────────────────────────
@@ -99,6 +111,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh container data after start/stop/restart/kill
 		return m, m.pane.Init()
 
+	// ── Image layers arrived ─────────────────────────
+	case imageLayersLoadedMsg:
+		if msg.imageID == m.selectedImageID && msg.err == nil {
+			m.imageLayers = msg.layers
+			m.logLines = nil // clear container logs
+		}
+		return m, nil
+
 	// ── Keyboard ─────────────────────────────────────
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -129,18 +149,35 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── Pane navigation (focus 1) ─────────────────
 		if m.focus == 1 {
 			prevName := m.selectedName
+			prevImgID := m.selectedImageID
 			var cmd tea.Cmd
 			m.pane, cmd = m.pane.Update(msg)
 
+			// Check container selection
 			newName := m.pane.SelectedContainer()
 			if newName != "" && newName != prevName {
 				m.selectedName = newName
+				m.selectedImageID = ""
+				m.imageLayers = nil
 				m.logAutoScroll = true
 				return m, tea.Batch(cmd,
 					fetchLogs(m.dc, newName),
 					fetchDiskUsage(m.dc, newName),
 				)
 			}
+
+			// Check image selection
+			newImgID := m.pane.SelectedImage()
+			if newImgID != "" && newImgID != prevImgID {
+				m.selectedImageID = newImgID
+				m.selectedName = ""
+				m.logLines = nil
+				m.logAutoScroll = true
+				return m, tea.Batch(cmd,
+					fetchImageHistory(m.dc, newImgID),
+				)
+			}
+
 			return m, cmd
 		}
 
@@ -170,16 +207,30 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── All other messages → pane (stats, data, etc.) ─
 	prevName := m.selectedName
+	prevImgID := m.selectedImageID
 	var cmd tea.Cmd
 	m.pane, cmd = m.pane.Update(msg)
 
 	newName := m.pane.SelectedContainer()
 	if newName != "" && newName != prevName {
 		m.selectedName = newName
+		m.selectedImageID = ""
+		m.imageLayers = nil
 		m.logAutoScroll = true
 		return m, tea.Batch(cmd,
 			fetchLogs(m.dc, newName),
 			fetchDiskUsage(m.dc, newName),
+		)
+	}
+
+	newImgID := m.pane.SelectedImage()
+	if newImgID != "" && newImgID != prevImgID {
+		m.selectedImageID = newImgID
+		m.selectedName = ""
+		m.logLines = nil
+		m.logAutoScroll = true
+		return m, tea.Batch(cmd,
+			fetchImageHistory(m.dc, newImgID),
 		)
 	}
 	return m, cmd
@@ -220,8 +271,11 @@ func (m AppModel) View() string {
 	var rightContent string
 
 	ctr := m.pane.GetSelectedContainer()
+	img := m.pane.GetSelectedImage()
 	if ctr != nil {
 		rightContent = m.renderOverview(innerW, innerH, ctr)
+	} else if img != nil {
+		rightContent = m.renderImageOverview(innerW, innerH, img)
 	} else {
 		rightContent = lipgloss.NewStyle().
 			Width(innerW).Height(innerH).
@@ -240,7 +294,7 @@ func (m AppModel) View() string {
 
 	rightView := rightStyle.Render(rightContent)
 
-	// ── Bottom pane (logs) ────────────────────────────
+	// ── Bottom pane (logs / image layers) ─────────────
 	bottomHeight := m.height - paneHeight
 	var bottomView string
 	if bottomHeight > 0 {
@@ -256,7 +310,12 @@ func (m AppModel) View() string {
 			BorderForeground(bottomBorder).
 			Background(m.theme.Background)
 
-		bottomView = bottomStyle.Render(m.renderLogs(m.width-2, bottomHeight-2))
+		// Show image layers or container logs
+		if len(m.imageLayers) > 0 {
+			bottomView = bottomStyle.Render(m.renderImageLayers(m.width-2, bottomHeight-2))
+		} else {
+			bottomView = bottomStyle.Render(m.renderLogs(m.width-2, bottomHeight-2))
+		}
 	}
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, paneView, rightView)
@@ -442,6 +501,158 @@ func (m AppModel) renderOverview(width, height int, ctr *docker.Container) strin
 	return strings.Join(lines, "\n")
 }
 
+// ── Image overview ────────────────────────────────────────────────
+
+func (m AppModel) renderImageOverview(width, height int, img *docker.Image) string {
+	if width < 10 || height < 3 {
+		return ""
+	}
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TabInactive).
+		Width(10)
+
+	valueStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Foreground).
+		Width(width - 12)
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TitleText).
+		Bold(true).
+		Width(width)
+
+	divider := lipgloss.NewStyle().
+		Foreground(m.theme.DividerLine).
+		Render(strings.Repeat("─", width))
+
+	row := func(label, value string) string {
+		return labelStyle.Render(label) + valueStyle.Render(value)
+	}
+
+	var b strings.Builder
+
+	// Title
+	title := img.Repo
+	if img.Tag != "<none>" && img.Tag != "" {
+		title += ":" + img.Tag
+	}
+	b.WriteString(titleStyle.Render(title))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// Fields
+	b.WriteString(row("ID:", truncateStr(img.ID, 20)))
+	b.WriteString("\n")
+	b.WriteString(row("Size:", img.Size))
+	b.WriteString("\n")
+	b.WriteString(row("Created:", img.Created))
+	b.WriteString("\n")
+	b.WriteString(row("Repo:", img.Repo))
+	b.WriteString("\n")
+	b.WriteString(row("Tag:", img.Tag))
+	b.WriteString("\n")
+
+	result := b.String()
+	lines := strings.Split(result, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ── Image layers viewer ───────────────────────────────────────────
+
+func (m AppModel) renderImageLayers(width, height int) string {
+	if width < 10 || height < 1 {
+		return ""
+	}
+
+	if len(m.imageLayers) == 0 {
+		return lipgloss.NewStyle().
+			Width(width).Height(height).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(m.theme.TabInactive).
+			Render("Loading image layers...")
+	}
+
+	headerStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TableHeader).
+		Bold(true)
+
+	divider := lipgloss.NewStyle().
+		Foreground(m.theme.DividerLine).
+		Render(strings.Repeat("─", width))
+
+	idW := 14
+	createdW := 10
+	sizeW := 8
+	cmdW := width - idW - createdW - sizeW - 6
+	if cmdW < 10 {
+		cmdW = 10
+	}
+
+	// Header
+	header := headerStyle.Render(
+		fitStr("LAYER ID", idW) + "  " +
+			fitStr("CREATED", createdW) + "  " +
+			fitStr("SIZE", sizeW) + "  " +
+			fitStr("COMMAND", cmdW))
+
+	idStyle := lipgloss.NewStyle().Foreground(m.theme.TabHighlight)
+	dimStyle := lipgloss.NewStyle().Foreground(m.theme.TabInactive)
+	bodyStyle := lipgloss.NewStyle().Foreground(m.theme.Foreground)
+
+	// Clamp scroll offset
+	maxOff := len(m.imageLayers) - height + 1
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.logScrollOff > maxOff {
+		m.logScrollOff = maxOff
+	}
+	if m.logScrollOff < 0 {
+		m.logScrollOff = 0
+	}
+
+	end := m.logScrollOff + height - 2 // -2 for header + divider
+	if end > len(m.imageLayers) {
+		end = len(m.imageLayers)
+	}
+
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n")
+
+	for i := m.logScrollOff; i < end; i++ {
+		l := m.imageLayers[i]
+		shortID := l.ID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+		line := idStyle.Render(fitStr(shortID, idW)) + "  " +
+			dimStyle.Render(fitStr(l.Created, createdW)) + "  " +
+			dimStyle.Render(fitStr(l.Size, sizeW)) + "  " +
+			bodyStyle.Render(fitStr(l.Command, cmdW))
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+
+	// Pad
+	rendered := end - m.logScrollOff + 2
+	for i := rendered; i < height; i++ {
+		b.WriteString(strings.Repeat(" ", width))
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
 func (m *AppModel) scrollLogsToEnd() {
 	visible := len(m.logLines)
 	if visible == 0 {
@@ -535,6 +746,15 @@ func splitIO(raw string) (string, string) {
 	return "", ""
 }
 
+// fitStr truncates or pads a string to exactly w runes.
+func fitStr(s string, w int) string {
+	runes := []rune(s)
+	if len(runes) > w {
+		return string(runes[:w])
+	}
+	return s + strings.Repeat(" ", w-len(runes))
+}
+
 // ── Commands ─────────────────────────────────────────────────────
 
 // logViewHeight returns the available height (in lines) for the
@@ -565,5 +785,14 @@ func fetchDiskUsage(dc *docker.Client, containerName string) tea.Cmd {
 			return imageSizeLoadedMsg{containerName: containerName, imageSize: "—"}
 		}
 		return imageSizeLoadedMsg{containerName: containerName, imageSize: size}
+	}
+}
+
+// fetchImageHistory returns a command that fetches the layer history
+// for the given image.
+func fetchImageHistory(dc *docker.Client, imageID string) tea.Cmd {
+	return func() tea.Msg {
+		layers, err := dc.GetImageHistory(imageID)
+		return imageLayersLoadedMsg{imageID: imageID, layers: layers, err: err}
 	}
 }

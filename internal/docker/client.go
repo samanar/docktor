@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -33,6 +34,24 @@ type Container struct {
 type ContainerGroup struct {
 	Project    string
 	Containers []Container
+}
+
+// Image represents a Docker image with the fields the TUI needs.
+type Image struct {
+	ID        string // short image ID
+	Repo      string // repository name (e.g. "nginx")
+	Tag       string // tag (e.g. "latest")
+	Size      string // human-readable size (e.g. "142MB")
+	CreatedAt string // ISO timestamp
+	Created   string // human-readable (e.g. "2 weeks ago")
+}
+
+// ImageLayer represents a single layer in a Docker image history.
+type ImageLayer struct {
+	ID      string // layer ID
+	Created string // e.g. "2 weeks ago"
+	Command string // the command that created this layer
+	Size    string // human-readable size
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -149,6 +168,118 @@ func (c *Client) RestartContainer(name string) error {
 func (c *Client) KillContainer(name string) error {
 	_, err := runDockerCLI("kill", name)
 	return err
+}
+
+// ── Images ───────────────────────────────────────────────────────
+
+// ListImages returns all Docker images.
+func (c *Client) ListImages() ([]Image, error) {
+	raw, err := runDockerCLI("image", "ls",
+		"--format", `{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}`)
+	if err != nil {
+		return nil, fmt.Errorf("docker image ls: %w", err)
+	}
+
+	var images []Image
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 5 {
+			continue
+		}
+		images = append(images, Image{
+			ID:        fields[0],
+			Repo:      fields[1],
+			Tag:       fields[2],
+			Size:      fields[3],
+			CreatedAt: fields[4],
+			Created:   formatDockerCreated(fields[4]),
+		})
+	}
+	return images, nil
+}
+
+// GetImageHistory returns the layer history for the given image.
+func (c *Client) GetImageHistory(imageID string) ([]ImageLayer, error) {
+	raw, err := runDockerCLI("image", "history", "--no-trunc",
+		"--format", `{{.ID}}\t{{.CreatedSince}}\t{{.CreatedBy}}\t{{.Size}}`, imageID)
+	if err != nil {
+		return nil, fmt.Errorf("docker image history %s: %w", imageID, err)
+	}
+
+	var layers []ImageLayer
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 4 {
+			continue
+		}
+		layers = append(layers, ImageLayer{
+			ID:      fields[0],
+			Created: fields[1],
+			Command: formatLayerCommand(fields[2]),
+			Size:    fields[3],
+		})
+	}
+	return layers, nil
+}
+
+// formatDockerCreated converts a docker timestamp to a short relative
+// string like "2w ago" or "3d ago".
+func formatDockerCreated(ts string) string {
+	if ts == "" {
+		return "—"
+	}
+	// Docker image timestamps: "2026-07-11 17:56:33 +0330 +0330"
+	parts := strings.Fields(ts)
+	if len(parts) < 2 {
+		return ts
+	}
+	datePart := parts[0]
+	// Parse "2026-07-11"
+	t, err := parseDate(datePart)
+	if err != nil {
+		return ts
+	}
+	days := int(timeSince(t).Hours() / 24)
+	switch {
+	case days < 1:
+		return "today"
+	case days < 7:
+		return fmt.Sprintf("%dd ago", days)
+	case days < 30:
+		return fmt.Sprintf("%dw ago", days/7)
+	case days < 365:
+		return fmt.Sprintf("%dM ago", days/30)
+	default:
+		return fmt.Sprintf("%dy ago", days/365)
+	}
+}
+
+// formatLayerCommand shortens the layer creation command for display.
+func formatLayerCommand(cmd string) string {
+	// Trim "/bin/sh -c " prefix if present
+	cmd = strings.TrimPrefix(cmd, "/bin/sh -c ")
+	// Trim "#(nop) " prefix
+	cmd = strings.TrimPrefix(cmd, "#(nop) ")
+	if len(cmd) > 60 {
+		cmd = cmd[:57] + "..."
+	}
+	return cmd
+}
+
+// parseDate parses "2026-07-11" format.
+func parseDate(s string) (time.Time, error) {
+	return time.Parse("2006-01-02", s)
+}
+
+// timeSince returns the duration since the given time.
+func timeSince(t time.Time) time.Duration {
+	return time.Now().Sub(t)
 }
 
 // ── Disk usage ───────────────────────────────────────────────────
