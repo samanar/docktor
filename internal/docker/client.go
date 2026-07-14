@@ -3,11 +3,29 @@ package docker
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
 
 // ── Types ──────────────────────────────────────────────────────────
+
+// Volume represents a single Docker volume.
+type Volume struct {
+	Name      string
+	Driver    string
+	Mountpoint string
+	Size      string // human-readable size, e.g. "824.6kB"
+	SizeBytes int64  // size in bytes for sorting
+	CreatedAt string
+}
+
+// VolumeFileUsage represents file/folder disk usage inside a volume.
+type VolumeFileUsage struct {
+	Name string // file or folder name
+	Size string // human-readable size, e.g. "12MB"
+	IsDir bool
+}
 
 // Container represents a single Docker container with the fields the
 // TUI needs to display.
@@ -330,6 +348,194 @@ func parseInt64(s string) (int64, error) {
 		n = n*10 + int64(ch-'0')
 	}
 	return n, nil
+}
+
+// ── Volumes ─────────────────────────────────────────────────────
+
+// GetVolumes returns all Docker volumes with their driver, mountpoint,
+// and size information.
+func (c *Client) GetVolumes() ([]Volume, error) {
+	// 1. Get volume names, drivers, and mountpoints from docker volume ls
+	// Use ||| as delimiter (docker volume ls --format may not interpret \t)
+	raw, err := runDockerCLI("volume", "ls",
+		"--format", `{{.Name}}|||{{.Driver}}|||{{.Mountpoint}}`)
+	if err != nil {
+		return nil, fmt.Errorf("docker volume ls: %w", err)
+	}
+
+	// 2. Get volume sizes from docker system df -v
+	volSizes, _ := c.getVolumeSizes()
+
+	var volumes []Volume
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "|||")
+		if len(fields) < 3 {
+			continue
+		}
+		name := fields[0]
+		driver := fields[1]
+		mountpoint := fields[2]
+
+		sizeBytes := volSizes[name]
+		sizeStr := "—"
+		if sizeBytes > 0 {
+			sizeStr = humanSize(sizeBytes)
+		}
+
+		volumes = append(volumes, Volume{
+			Name:       name,
+			Driver:     driver,
+			Mountpoint: mountpoint,
+			Size:       sizeStr,
+			SizeBytes:  sizeBytes,
+		})
+	}
+
+	// Sort by size descending, then by name
+	sortVolumes(volumes)
+
+	return volumes, nil
+}
+
+// GetVolumeFileUsage returns per-file/folder disk usage inside a
+// Docker volume. Uses the volume's host mountpoint to run du
+// directly, which is fast and requires no image pulls.
+// Falls back to a docker-run approach if the host path is
+// inaccessible.
+func (c *Client) GetVolumeFileUsage(name string) ([]VolumeFileUsage, error) {
+	// Primary: use host filesystem via volume mountpoint.
+	entries, err := c.getVolumeFileUsageHost(name)
+	if err == nil && len(entries) > 0 {
+		return entries, nil
+	}
+
+	// Fallback: use a lightweight container to inspect the volume.
+	// Try busybox first (tiny, commonly cached), then alpine.
+	// Use sh -c so the glob * is expanded by the shell inside the container.
+	raw, err2 := runDockerCLI("run", "--rm",
+		"-v", name+":/vol:ro",
+		"busybox", "sh", "-c", "du -sh /vol/*")
+	if err2 != nil {
+		raw, err2 = runDockerCLI("run", "--rm",
+			"-v", name+":/vol:ro",
+			"alpine", "sh", "-c", "du -sh /vol/*")
+		if err2 != nil {
+			// Return the original host-path error if everything failed
+			if err != nil {
+				return nil, err
+			}
+			return nil, err2
+		}
+	}
+	return parseDUOutput(raw), nil
+}
+
+// getVolumeFileUsageHost is a fallback that reads the volume
+// mountpoint directly from the host filesystem.
+func (c *Client) getVolumeFileUsageHost(name string) ([]VolumeFileUsage, error) {
+	raw, err := runDockerCLI("volume", "inspect", name,
+		"--format", `{{.Mountpoint}}`)
+	if err != nil {
+		return nil, fmt.Errorf("docker volume inspect: %w", err)
+	}
+	mountpoint := strings.TrimSpace(raw)
+	if mountpoint == "" {
+		return nil, fmt.Errorf("empty mountpoint for volume %s", name)
+	}
+	return getDirUsage(mountpoint)
+}
+
+// parseDUOutput parses the output of "du -sh /path/*" into
+// VolumeFileUsage entries.
+func parseDUOutput(raw string) []VolumeFileUsage {
+	var entries []VolumeFileUsage
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		size := fields[0]
+		itemPath := fields[1]
+
+		// Just the basename
+		name := itemPath
+		if idx := strings.LastIndex(itemPath, "/"); idx >= 0 {
+			name = itemPath[idx+1:]
+		}
+
+		// du output: directories end with / in the path
+		isDir := strings.HasSuffix(itemPath, "/") || itemPath[len(itemPath)-1] == '/'
+
+		entries = append(entries, VolumeFileUsage{
+			Name:  name,
+			Size:  size,
+			IsDir: isDir,
+		})
+	}
+
+	// Sort by size descending
+	sortFileUsage(entries)
+
+	return entries
+}
+
+// getDirUsage runs du on a host path and returns per-item sizes.
+// Uses a shell to correctly expand the glob pattern.
+func getDirUsage(path string) ([]VolumeFileUsage, error) {
+	// Use sh -c so the glob * is expanded by the shell.
+	// Redirect stderr to capture permission errors separately.
+	cmd := exec.Command("sh", "-c",
+		fmt.Sprintf("du -sh -- '%s'/* 2>/dev/null", path))
+	out, err := cmd.Output()
+	if err != nil {
+		// Check if the directory is readable at all
+		if _, statErr := os.Stat(path); statErr != nil {
+			return nil, fmt.Errorf("cannot access volume path %s: %w", path, statErr)
+		}
+		// Directory exists but du failed (empty dir, or all items denied)
+		return nil, nil
+	}
+	return parseDUOutput(string(out)), nil
+}
+
+// isDirectory returns true if the given path is a directory.
+func isDirectory(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+// sortVolumes sorts volumes by size (descending), then alphabetically.
+func sortVolumes(vols []Volume) {
+	for i := 0; i < len(vols); i++ {
+		for j := i + 1; j < len(vols); j++ {
+			if vols[j].SizeBytes > vols[i].SizeBytes ||
+				(vols[j].SizeBytes == vols[i].SizeBytes &&
+					vols[j].Name < vols[i].Name) {
+				vols[i], vols[j] = vols[j], vols[i]
+			}
+		}
+	}
+}
+
+// sortFileUsage sorts volume file usage entries by size (descending).
+func sortFileUsage(entries []VolumeFileUsage) {
+	// Parse sizes and sort
+	for i := 0; i < len(entries); i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if parseHumanSize(entries[j].Size) > parseHumanSize(entries[i].Size) {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
