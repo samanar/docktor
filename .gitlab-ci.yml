@@ -1,0 +1,128 @@
+# GitLab CI/CD pipeline for docktor
+# Builds Linux and macOS binaries, runs tests, and creates releases on version tags.
+
+stages:
+  - test
+  - build
+  - release
+
+variables:
+  APP_NAME: docktor
+  GO_VERSION: "1.23"
+
+# ── Templates ──────────────────────────────────────────────────────
+
+.go_cache:
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .go-cache/
+
+# ── Test ───────────────────────────────────────────────────────────
+
+test:
+  stage: test
+  image: golang:${GO_VERSION}
+  extends: .go_cache
+  script:
+    - go test -v -race ./...
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v/
+
+# ── Build ──────────────────────────────────────────────────────────
+
+# Build matrix: linux amd64, linux arm64, darwin amd64, darwin arm64
+.build-template: &build
+  stage: build
+  extends: .go_cache
+  script:
+    - GOOS=${GOOS} GOARCH=${GOARCH} go build -ldflags="-s -w" -o bin/${APP_NAME}-${GOOS}-${GOARCH} ./cmd/${APP_NAME}/
+  artifacts:
+    name: "${APP_NAME}-${GOOS}-${GOARCH}-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - bin/
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build:linux-amd64:
+  <<: *build
+  image: golang:${GO_VERSION}-alpine
+  variables:
+    GOOS: linux
+    GOARCH: amd64
+
+build:linux-arm64:
+  <<: *build
+  image: golang:${GO_VERSION}-alpine
+  variables:
+    GOOS: linux
+    GOARCH: arm64
+
+build:darwin-amd64:
+  <<: *build
+  image: golang:${GO_VERSION}-alpine
+  variables:
+    GOOS: darwin
+    GOARCH: amd64
+
+build:darwin-arm64:
+  <<: *build
+  image: golang:${GO_VERSION}-alpine
+  variables:
+    GOOS: darwin
+    GOARCH: arm64
+
+# ── Release ────────────────────────────────────────────────────────
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - build:linux-amd64
+    - build:linux-arm64
+    - build:darwin-amd64
+    - build:darwin-arm64
+  script:
+    - echo "Creating release for ${CI_COMMIT_TAG}"
+  release:
+    name: "${CI_COMMIT_TAG}"
+    description: |
+      ## docktor ${CI_COMMIT_TAG}
+
+      ### Downloads
+
+      | Platform | Architecture | Binary |
+      |----------|-------------|--------|
+      | Linux    | amd64       | `docktor-linux-amd64` |
+      | Linux    | arm64       | `docktor-linux-arm64` |
+      | macOS    | amd64       | `docktor-darwin-amd64` |
+      | macOS    | arm64       | `docktor-darwin-arm64` |
+
+      ### Installation
+
+      Download the binary for your platform, make it executable, and run:
+
+      ```bash
+      chmod +x docktor-<os>-<arch>
+      ./docktor-<os>-<arch>
+      ```
+    assets:
+      links:
+        - name: "docktor-linux-amd64"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_SHA}/raw/bin/docktor-linux-amd64?job=build%3Alinux-amd64"
+          link_type: package
+        - name: "docktor-linux-arm64"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_SHA}/raw/bin/docktor-linux-arm64?job=build%3Alinux-arm64"
+          link_type: package
+        - name: "docktor-darwin-amd64"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_SHA}/raw/bin/docktor-darwin-amd64?job=build%3Adarwin-amd64"
+          link_type: package
+        - name: "docktor-darwin-arm64"
+          url: "${CI_PROJECT_URL}/-/jobs/artifacts/${CI_COMMIT_SHA}/raw/bin/docktor-darwin-arm64?job=build%3Adarwin-arm64"
+          link_type: package
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
