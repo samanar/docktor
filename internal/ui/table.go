@@ -259,6 +259,10 @@ func (t Table) HighlightedRow() int { return t.selected }
 // RowCount returns the number of rows currently in the table.
 func (t Table) RowCount() int { return len(t.rows) }
 
+// VisibleHeight returns the number of data rows the table can show
+// at once (the height set via SetHeight).
+func (t Table) VisibleHeight() int { return t.height }
+
 // RowTypeAt returns the type of the row at the given index.
 func (t Table) RowTypeAt(idx int) RowType {
 	if idx < 0 || idx >= len(t.rows) {

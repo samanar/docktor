@@ -50,6 +50,14 @@ type statsRefreshMsg struct {
 	err   error
 }
 
+// actionExecutedMsg is sent after a container action (start/stop/etc.)
+// completes.  The app should refresh container data afterwards.
+type actionExecutedMsg struct {
+	action string // "start", "stop", "restart", "kill"
+	name   string
+	err    error
+}
+
 // ── Tab ──────────────────────────────────────────────────────────
 
 // Tab represents a single tab in the pane's tab bar.
@@ -104,6 +112,15 @@ type Pane struct {
 
 	// ── Collapsible groups ───────────────────────────
 	collapsedGroups map[string]bool
+
+	// ── Search ───────────────────────────────────────
+	searchMode     bool   // true when search bar is active
+	searchQuery    string // current search text
+	searchMatches  []int  // table row indices matching the query
+	searchMatchIdx int    // current position within searchMatches
+
+	// ── Vim navigation ───────────────────────────────
+	pendingG bool // waiting for second 'g' for gg (go to top)
 }
 
 // NewPane creates a new navigator pane with default tabs, actions,
@@ -113,14 +130,14 @@ func NewPane(theme Theme, dc *docker.Client) Pane {
 		{Key: 'c', Label: "Containers"},
 		{Key: 'i', Label: "Images"},
 		{Key: 'v', Label: "Volumes"},
-		{Key: 'n', Label: "Networks"},
+		{Key: 'N', Label: "Networks"},
 	}
 
 	actions := []Action{
-		{Key: 's', Label: "Stop"},
+		{Key: 's', Label: "Start"},
+		{Key: 'x', Label: "Stop"},
 		{Key: 'r', Label: "Restart"},
-		{Key: 'd', Label: "Remove"},
-		{Key: 'l', Label: "Logs"},
+		{Key: 'K', Label: "Kill"},
 		{Key: '/', Label: "Filter"},
 		{Key: 'q', Label: "Quit"},
 	}
@@ -227,9 +244,41 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 			return p, nil
 		}
 
+		// ── Search mode: intercept all keys ────────────
+		if p.searchMode {
+			switch msg.Type {
+			case tea.KeyEscape:
+				p.searchMode = false
+				p.searchQuery = ""
+				return p, nil
+
+			case tea.KeyEnter:
+				p.searchMode = false
+				p.doSearch()
+				return p, nil
+
+			case tea.KeyBackspace:
+				if len(p.searchQuery) > 0 {
+					p.searchQuery = p.searchQuery[:len(p.searchQuery)-1]
+				}
+				return p, nil
+
+			case tea.KeyRunes:
+				p.searchQuery += string(msg.Runes)
+				return p, nil
+			}
+			return p, nil
+		}
+
+		// ── Not in search mode ─────────────────────────
 		// Block navigation while loading
 		if p.loading {
 			return p, nil
+		}
+
+		// Reset gg detection on any non-g key
+		if msg.Type != tea.KeyRunes || string(msg.Runes) != "g" {
+			p.pendingG = false
 		}
 
 		// ── Arrow keys + vim navigation ────────────────
@@ -241,6 +290,12 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		case tea.KeyDown:
 			p.table.MoveSelection(1)
 
+		case tea.KeyCtrlD:
+			p.scrollHalfPage(1)
+
+		case tea.KeyCtrlU:
+			p.scrollHalfPage(-1)
+
 		case tea.KeyEnter:
 			p.toggleGroup()
 
@@ -248,9 +303,32 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		case tea.KeyRunes:
 			switch string(msg.Runes) {
 			case "j":
+				p.pendingG = false
 				p.table.MoveSelection(1)
 			case "k":
+				p.pendingG = false
 				p.table.MoveSelection(-1)
+
+			// Vim: gg → top, G → bottom
+			case "g":
+				if p.pendingG {
+					p.pendingG = false
+					p.table.SelectFirst()
+				} else {
+					p.pendingG = true
+				}
+				return p, nil
+			case "G":
+				p.pendingG = false
+				p.goToLastRow()
+
+			// Search
+			case "/":
+				p.searchMode = true
+				p.searchQuery = ""
+				return p, nil
+			case "n":
+				p.nextSearchMatch()
 
 			// Tab switching
 			case "c":
@@ -259,20 +337,26 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 				p.activeTab = p.tabIndexByKey('i')
 			case "v":
 				p.activeTab = p.tabIndexByKey('v')
-			case "n":
-				p.activeTab = p.tabIndexByKey('n')
+			case "N":
+				p.activeTab = p.tabIndexByKey('N')
 
 			// Toggle group collapse
 			case " ":
 				p.toggleGroup()
 
-			// Actions (placeholder)
-			case "s", "r", "d", "l":
-			// will trigger container actions later
+			// ── Actions ─────────────────────────────
+			case "s":
+				return p, p.doAction("start", p.dockerClient.StartContainer)
+			case "x":
+				return p, p.doAction("stop", p.dockerClient.StopContainer)
+			case "r":
+				return p, p.doAction("restart", p.dockerClient.RestartContainer)
+			case "K":
+				return p, p.doAction("kill", p.dockerClient.KillContainer)
 
-			// Filter (placeholder)
-			case "/":
-				// will trigger filter
+			// Quit — delegated to AppModel
+			case "q":
+				return p, func() tea.Msg { return tea.Quit() }
 			}
 		}
 	}
@@ -300,7 +384,15 @@ func (p Pane) View() string {
 	divider := p.renderDivider(innerW)
 
 	// ── Content area ─────────────────────────────────
-	contentH := innerH - 4 // -4 = tabBar + 2 dividers + actionBar
+	// Reserve space for search bar when active
+	searchBarH := 0
+	if p.searchMode {
+		searchBarH = 1
+	}
+	contentH := innerH - 4 - searchBarH
+	if contentH < 1 {
+		contentH = 1
+	}
 	var contentArea string
 	if p.loading {
 		contentArea = p.renderLoading(innerW, contentH)
@@ -310,18 +402,22 @@ func (p Pane) View() string {
 		contentArea = padLines(p.table.View(), innerW, 2)
 	}
 
+	// ── Search bar ───────────────────────────────────
+	var searchBar string
+	if p.searchMode {
+		searchBar = p.renderSearchBar(innerW)
+	}
+
 	// ── Action bar ───────────────────────────────────
 	actionBar := p.renderActionBar(innerW)
 
 	// ── Assemble inner content ───────────────────────
-	inner := lipgloss.JoinVertical(
-		lipgloss.Top,
-		tabBar,
-		divider,
-		contentArea,
-		divider,
-		actionBar,
-	)
+	parts := []string{tabBar, divider, contentArea}
+	if p.searchMode {
+		parts = append(parts, searchBar)
+	}
+	parts = append(parts, divider, actionBar)
+	inner := lipgloss.JoinVertical(lipgloss.Top, parts...)
 
 	// ── Wrap with border ─────────────────────────────
 	borderColor := p.theme.BorderFocused
@@ -402,6 +498,35 @@ func (p Pane) renderActionBar(width int) string {
 		Render(bar)
 }
 
+// renderSearchBar draws the search input bar with the current query
+// and a blinking cursor indicator.
+func (p Pane) renderSearchBar(width int) string {
+	prompt := "/"
+	query := p.searchQuery + "█" // cursor indicator
+
+	text := lipgloss.NewStyle().
+		Foreground(p.theme.Foreground).
+		Render(prompt + query)
+
+	count := ""
+	if len(p.searchMatches) > 0 {
+		count = fmt.Sprintf("[%d/%d]", p.searchMatchIdx+1, len(p.searchMatches))
+		count = lipgloss.NewStyle().
+			Foreground(p.theme.TabInactive).
+			Render(count)
+	}
+
+	// Left-align the search text, right-align the match counter
+	left := lipgloss.NewStyle().Width(width - 5).Render(text)
+	right := lipgloss.NewStyle().Width(5).Align(lipgloss.Right).Render(count)
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Background(p.theme.ActionBarBackground).
+		Padding(0, 1).
+		Render(left + right)
+}
+
 // ── Internal helpers ─────────────────────────────────────────────
 
 // recalcTable updates the table's width and height based on the
@@ -420,8 +545,12 @@ func (p *Pane) toggleGroup() {
 
 func (p *Pane) recalcTable() {
 	// Content area: total height - borders(2) - tabBar(1) -
-	//   dividers(2) - actionBar(1)
-	contentH := p.height - 2 - 1 - 2 - 1
+	//   dividers(2) - actionBar(1) - searchBar(1 if active)
+	searchH := 0
+	if p.searchMode {
+		searchH = 1
+	}
+	contentH := p.height - 2 - 1 - 2 - 1 - searchH
 	if contentH < 1 {
 		contentH = 1
 	}
@@ -478,6 +607,132 @@ func (p Pane) GetSelectedContainer() *docker.Container {
 		}
 	}
 	return nil
+}
+
+// doAction returns a tea.Cmd that executes the given action function
+// on the currently selected container.  Returns nil if no container
+// is selected.
+func (p Pane) doAction(action string, fn func(string) error) tea.Cmd {
+	name := p.SelectedContainer()
+	if name == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		err := fn(name)
+		return actionExecutedMsg{action: action, name: name, err: err}
+	}
+}
+
+// ── Search ────────────────────────────────────────────────────────
+
+// doSearch finds all rows whose container name contains the current
+// search query (case-insensitive) and jumps to the first match.
+func (p *Pane) doSearch() {
+	q := strings.ToLower(p.searchQuery)
+	if q == "" {
+		p.searchMatches = nil
+		p.searchMatchIdx = 0
+		return
+	}
+
+	p.searchMatches = nil
+	for i := 0; i < p.table.RowCount(); i++ {
+		if p.table.RowTypeAt(i) != RowData {
+			continue
+		}
+		name, ok := p.table.GetCell(i, colName)
+		if !ok {
+			continue
+		}
+		if strings.Contains(strings.ToLower(name), q) {
+			p.searchMatches = append(p.searchMatches, i)
+		}
+	}
+
+	if len(p.searchMatches) > 0 {
+		p.searchMatchIdx = 0
+		p.jumpToRow(p.searchMatches[0])
+	}
+}
+
+// nextSearchMatch moves to the next search match, wrapping around
+// after the last one.
+func (p *Pane) nextSearchMatch() {
+	if len(p.searchMatches) == 0 {
+		return
+	}
+	p.searchMatchIdx = (p.searchMatchIdx + 1) % len(p.searchMatches)
+	p.jumpToRow(p.searchMatches[p.searchMatchIdx])
+}
+
+// jumpToRow sets the table selection to the given row index and
+// scrolls it into view.
+func (p *Pane) jumpToRow(idx int) {
+	if idx < 0 || idx >= p.table.RowCount() {
+		return
+	}
+	// Move to first row, then step to target
+	p.table.SelectFirst()
+	for i := 0; i < idx; i++ {
+		p.table.MoveSelection(1)
+	}
+}
+
+// goToLastRow moves the selection to the last row in the table.
+func (p *Pane) goToLastRow() {
+	n := p.table.RowCount()
+	if n == 0 {
+		return
+	}
+	p.jumpToRow(n - 1)
+}
+
+// scrollHalfPage moves the selection by half the visible table height.
+// Positive delta scrolls down, negative scrolls up.
+func (p *Pane) scrollHalfPage(delta int) {
+	half := p.table.VisibleHeight() / 2
+	if half < 1 {
+		half = 1
+	}
+	for i := 0; i < half; i++ {
+		p.table.MoveSelection(delta)
+	}
+}
+
+// SelectedContainerImage returns the image name of the currently
+// highlighted container, or "" if none is selected.
+func (p Pane) SelectedContainerImage() string {
+	ctr := p.GetSelectedContainer()
+	if ctr == nil {
+		return ""
+	}
+	return ctr.Image
+}
+
+// SetContainerImageSize updates the ImageSize field for the
+// container with the given name.  This is called asynchronously
+// when the image size has been fetched.
+func (p *Pane) SetContainerImageSize(name, size string) {
+	for gi := range p.groups {
+		for ci := range p.groups[gi].Containers {
+			if p.groups[gi].Containers[ci].Name == name {
+				p.groups[gi].Containers[ci].ImageSize = size
+				return
+			}
+		}
+	}
+}
+
+// ── Stats helpers ─────────────────────────────────────────────────
+
+// memUsedPortion extracts the used part from a "used / total" memory
+// string (e.g. "80MiB / 1.5GiB" → "80MiB").  Falls back to the
+// original value when the format doesn't match.
+func memUsedPortion(mem string) string {
+	if idx := strings.Index(mem, " / "); idx >= 0 {
+		return mem[:idx]
+	}
+	return mem
 }
 
 // ── Table construction ───────────────────────────────────────────
@@ -590,10 +845,11 @@ func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[s
 
 			shortName := shortenName(c.Name)
 
-			// Combined CPU / Memory
-			cpuMem := c.CPU + " / " + c.Memory
+			// Combined CPU / Memory (compact for table column)
+			memUsed := memUsedPortion(c.Memory)
+			cpuMem := c.CPU + " / " + memUsed
 			cpuMemCell := Cell{Value: cpuMem, Style: bodyStyle}
-			if c.CPU == "—" && c.Memory == "—" {
+			if c.CPU == "—" && memUsed == "—" {
 				cpuMemCell.Style = dimStyle
 			}
 

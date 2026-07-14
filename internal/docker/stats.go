@@ -12,17 +12,22 @@ import (
 type ContainerStats struct {
 	Name     string
 	CPUPerc  string // e.g. "1.23%"
-	MemUsage string // e.g. "80MiB"  (used portion only)
+	MemUsage string // e.g. "80MiB / 1.5GiB" (used / total)
 	MemPerc  string // e.g. "2.45%"
+	NetIO    string // e.g. "1.2GB / 400MB" (tx / rx)
+	BlockIO  string // e.g. "3.4GB / 1.2GB" (read / write)
 }
 
 // statsLine mirrors the JSON object emitted by
-//   docker stats --no-stream --format '{{json .}}'
+//
+//	docker stats --no-stream --format '{{json .}}'
 type statsLine struct {
 	Name     string `json:"Name"`
 	CPUPerc  string `json:"CPUPerc"`
 	MemUsage string `json:"MemUsage"`
 	MemPerc  string `json:"MemPerc"`
+	NetIO    string `json:"NetIO"`
+	BlockIO  string `json:"BlockIO"`
 }
 
 // ── Stats fetching ─────────────────────────────────────────────────
@@ -46,24 +51,21 @@ func (c *Client) GetStats() (map[string]ContainerStats, error) {
 		if err := json.Unmarshal([]byte(line), &sl); err != nil {
 			continue // skip malformed lines
 		}
-		// Extract just the used portion of memory ("80MiB / 1.5GiB" → "80MiB")
-		memUsed := sl.MemUsage
-		if idx := strings.Index(memUsed, " / "); idx >= 0 {
-			memUsed = memUsed[:idx]
-		}
 		result[sl.Name] = ContainerStats{
 			Name:     sl.Name,
 			CPUPerc:  sl.CPUPerc,
-			MemUsage: memUsed,
+			MemUsage: sl.MemUsage,
 			MemPerc:  sl.MemPerc,
+			NetIO:    sl.NetIO,
+			BlockIO:  sl.BlockIO,
 		}
 	}
 	return result, nil
 }
 
-// MergeStats copies CPU / Memory values from the stats map into the
-// matching containers in-place.  Containers not present in the map
-// keep their previous values.
+// MergeStats copies CPU / Memory / Network / Disk values from the
+// stats map into the matching containers in-place.  Containers not
+// present in the map keep their previous values.
 func MergeStats(groups []ContainerGroup, stats map[string]ContainerStats) {
 	for gi := range groups {
 		for ci := range groups[gi].Containers {
@@ -71,6 +73,8 @@ func MergeStats(groups []ContainerGroup, stats map[string]ContainerStats) {
 			if s, ok := stats[name]; ok {
 				groups[gi].Containers[ci].CPU = s.CPUPerc
 				groups[gi].Containers[ci].Memory = s.MemUsage
+				groups[gi].Containers[ci].NetIO = s.NetIO
+				groups[gi].Containers[ci].BlockIO = s.BlockIO
 			}
 		}
 	}

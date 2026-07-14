@@ -52,6 +52,13 @@ type logsLoadedMsg struct {
 	err           error
 }
 
+// imageSizeLoadedMsg is sent when the image size for a container
+// has been fetched.
+type imageSizeLoadedMsg struct {
+	containerName string
+	imageSize     string
+}
+
 // ── Bubble Tea Model ─────────────────────────────────────────────
 
 func (m AppModel) Init() tea.Cmd {
@@ -81,6 +88,16 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	// ── Image size arrived ───────────────────────────
+	case imageSizeLoadedMsg:
+		m.pane.SetContainerImageSize(msg.containerName, msg.imageSize)
+		return m, nil
+
+	// ── Container action completed ───────────────────
+	case actionExecutedMsg:
+		// Refresh container data after start/stop/restart/kill
+		return m, m.pane.Init()
 
 	// ── Keyboard ─────────────────────────────────────
 	case tea.KeyMsg:
@@ -119,7 +136,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if newName != "" && newName != prevName {
 				m.selectedName = newName
 				m.logAutoScroll = true
-				return m, tea.Batch(cmd, fetchLogs(m.dc, newName))
+				return m, tea.Batch(cmd,
+					fetchLogs(m.dc, newName),
+					fetchDiskUsage(m.dc, newName),
+				)
 			}
 			return m, cmd
 		}
@@ -157,7 +177,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if newName != "" && newName != prevName {
 		m.selectedName = newName
 		m.logAutoScroll = true
-		return m, tea.Batch(cmd, fetchLogs(m.dc, newName))
+		return m, tea.Batch(cmd,
+			fetchLogs(m.dc, newName),
+			fetchDiskUsage(m.dc, newName),
+		)
 	}
 	return m, cmd
 }
@@ -376,6 +399,12 @@ func (m AppModel) renderOverview(width, height int, ctr *docker.Container) strin
 	b.WriteString("\n")
 	b.WriteString(row("Memory:", ctr.Memory))
 	b.WriteString("\n")
+	if ctr.NetIO != "" && ctr.NetIO != "0B / 0B" {
+		b.WriteString(row("Network:", formatNetIO(ctr.NetIO)))
+		b.WriteString("\n")
+	}
+	b.WriteString(row("Disk:", ctr.ImageSize))
+	b.WriteString("\n")
 	b.WriteString(row("Ports:", formatPorts(ctr.Ports)))
 	b.WriteString("\n")
 
@@ -483,6 +512,29 @@ func truncateStr(s string, n int) string {
 	return string(runes[:n-1]) + "…"
 }
 
+// formatNetIO parses a docker stats NetIO value (e.g. "1.2GB / 400MB")
+// into a display string with arrows: "↑1.2GB ↓400MB".
+func formatNetIO(raw string) string {
+	tx, rx := splitIO(raw)
+	if tx == "" {
+		return raw
+	}
+	return "↑" + tx + " ↓" + rx
+}
+
+// formatDiskIO returns the raw BlockIO value as-is (e.g. "3.4GB / 1.2GB").
+func formatDiskIO(raw string) string {
+	return raw
+}
+
+// splitIO splits a "valueA / valueB" string into its two parts.
+func splitIO(raw string) (string, string) {
+	if idx := strings.Index(raw, " / "); idx >= 0 {
+		return strings.TrimSpace(raw[:idx]), strings.TrimSpace(raw[idx+3:])
+	}
+	return "", ""
+}
+
 // ── Commands ─────────────────────────────────────────────────────
 
 // logViewHeight returns the available height (in lines) for the
@@ -501,5 +553,17 @@ func fetchLogs(dc *docker.Client, containerName string) tea.Cmd {
 	return func() tea.Msg {
 		logs, err := dc.GetLogs(containerName)
 		return logsLoadedMsg{containerName: containerName, logs: logs, err: err}
+	}
+}
+
+// fetchDiskUsage returns a command that fetches the total disk usage
+// (writable layer + mounted volumes) of the given container.
+func fetchDiskUsage(dc *docker.Client, containerName string) tea.Cmd {
+	return func() tea.Msg {
+		size, err := dc.GetContainerDiskUsage(containerName)
+		if err != nil {
+			return imageSizeLoadedMsg{containerName: containerName, imageSize: "—"}
+		}
+		return imageSizeLoadedMsg{containerName: containerName, imageSize: size}
 	}
 }
