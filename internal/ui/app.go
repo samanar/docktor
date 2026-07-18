@@ -32,13 +32,13 @@ type AppModel struct {
 	selectedName  string
 
 	// Image layer viewer state
-	imageLayers    []docker.ImageLayer
+	imageLayers     []docker.ImageLayer
 	selectedImageID string
 
 	// Network detail state
-	selectedNetworkName    string
-	networkDetailLines     []string
-	networkDetailScrollOff int
+	selectedNetworkName     string
+	networkDetailLines      []string
+	networkDetailScrollOff  int
 	networkDetailAutoScroll bool
 }
 

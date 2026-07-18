@@ -180,6 +180,11 @@ var containerActions = []Action{
 	{Key: 'q', Label: "Quit"},
 }
 
+var imageActions = []Action{
+	{Key: '/', Label: "Filter"},
+	{Key: 'q', Label: "Quit"},
+}
+
 var networkActions = []Action{
 	{Key: 'I', Label: "Inspect"},
 	{Key: 'P', Label: "Prune"},
@@ -454,14 +459,11 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 			// Tab switching
 			case "c":
-				p.switchTab('c')
-				return p, nil
+				return p, p.switchTab('c')
 			case "i":
-				p.switchTab('i')
-				return p, nil
+				return p, p.switchTab('i')
 			case "v":
-				p.switchTab('v')
-				return p, nil
+				return p, p.switchTab('v')
 			case "N":
 				return p, p.switchTab('N')
 
@@ -754,6 +756,16 @@ func (p *Pane) switchTab(key rune) tea.Cmd {
 		p.rebuildTableRows()
 		p.recalcTable()
 		return nil
+
+	case 'i':
+		// Swap to image columns and actions
+		p.table = p.table.WithColumns(imageColumns())
+		p.actions = imageActions
+		p.loading = true
+		return tea.Batch(
+			fetchImages(p.dockerClient),
+			spinnerTick(),
+		)
 
 	default:
 		// Swap back to container columns and actions
@@ -1071,10 +1083,10 @@ func buildImageRows(theme Theme, images []docker.Image) []Row {
 
 		row := Row{
 			Cells: map[string]Cell{
-				colName:  {Value: img.Repo, Style: bodyStyle},
-				"tag":    {Value: img.Tag, Style: bodyStyle},
-				colIcon:  {Value: shortID, Style: idStyle},
-				"size":   {Value: img.Size, Style: dimStyle},
+				colName:   {Value: img.Repo, Style: bodyStyle},
+				"tag":     {Value: img.Tag, Style: bodyStyle},
+				colIcon:   {Value: shortID, Style: idStyle},
+				"size":    {Value: img.Size, Style: dimStyle},
 				"created": {Value: img.Created, Style: dimStyle},
 			},
 			Type: RowData,
@@ -1096,6 +1108,7 @@ func networkColumns() []ColumnDef {
 		{Key: colContainers, Title: "CNT", Width: 5},
 	}
 }
+
 // buildTableRows converts Docker container groups into table Rows
 // with status dots, Docker-style coloring, collapsible groups, and
 // visual separators between groups.
@@ -1300,6 +1313,8 @@ func (p *Pane) rebuildTableRows() {
 	var rows []Row
 	if p.ActiveTabKey() == 'N' {
 		rows = buildNetworkRows(p.theme, p.networks, p.networkCollapsed)
+	} else if p.ActiveTabKey() == 'i' {
+		rows = buildImageRows(p.theme, p.images)
 	} else {
 		rows = buildTableRows(p.theme, p.groups, p.collapsedGroups)
 	}
