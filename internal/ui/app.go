@@ -40,6 +40,12 @@ type AppModel struct {
 	networkDetailLines      []string
 	networkDetailScrollOff  int
 	networkDetailAutoScroll bool
+
+	// Volume viewer state
+	selectedVolume    string
+	volumeFileUsage   []docker.VolumeFileUsage
+	volumeUsageErr    error
+	selectedVolumeObj *docker.Volume
 }
 
 // NewApp creates the root application model with the given theme.
@@ -78,6 +84,14 @@ type imageLayersLoadedMsg struct {
 	err     error
 }
 
+// volumeUsageLoadedMsg is sent when the per-file/folder usage
+// for a volume has been fetched.
+type volumeUsageLoadedMsg struct {
+	volumeName string
+	entries    []docker.VolumeFileUsage
+	err        error
+}
+
 // ── Bubble Tea Model ─────────────────────────────────────────────
 
 func (m AppModel) Init() tea.Cmd {
@@ -111,6 +125,19 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Image size arrived ───────────────────────────
 	case imageSizeLoadedMsg:
 		m.pane.SetContainerImageSize(msg.containerName, msg.imageSize)
+		return m, nil
+
+	// ── Volume file usage arrived ────────────────────
+	case volumeUsageLoadedMsg:
+		if msg.volumeName == m.selectedVolume {
+			if msg.err != nil {
+				m.volumeUsageErr = msg.err
+				m.volumeFileUsage = nil
+			} else {
+				m.volumeUsageErr = nil
+				m.volumeFileUsage = msg.entries
+			}
+		}
 		return m, nil
 
 	// ── Container action completed ───────────────────
@@ -173,6 +200,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			prevContainer := m.selectedName
 			prevNetwork := m.selectedNetworkName
 			prevImgID := m.selectedImageID
+			prevVol := m.selectedVolume
 			var cmd tea.Cmd
 			m.pane, cmd = m.pane.Update(msg)
 
@@ -183,6 +211,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedNetworkName = ""
 				m.selectedImageID = ""
 				m.imageLayers = nil
+				m.selectedVolume = ""
+				m.selectedVolumeObj = nil
+				m.volumeFileUsage = nil
 				m.logAutoScroll = true
 				return m, tea.Batch(cmd,
 					fetchLogs(m.dc, newContainer),
@@ -206,10 +237,30 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if newImgID != "" && newImgID != prevImgID {
 				m.selectedImageID = newImgID
 				m.selectedName = ""
+				m.selectedNetworkName = ""
+				m.selectedVolume = ""
+				m.selectedVolumeObj = nil
 				m.logLines = nil
 				m.logAutoScroll = true
 				return m, tea.Batch(cmd,
 					fetchImageHistory(m.dc, newImgID),
+				)
+			}
+
+			// Check for volume selection change
+			newVol := m.pane.SelectedVolume()
+			if newVol != "" && newVol != prevVol {
+				m.selectedVolume = newVol
+				m.selectedName = ""
+				m.selectedImageID = ""
+				m.selectedNetworkName = ""
+				m.imageLayers = nil
+				m.logAutoScroll = true
+				m.logLines = nil
+				m.volumeUsageErr = nil
+				m.selectedVolumeObj = m.pane.FindVolume(newVol)
+				return m, tea.Batch(cmd,
+					fetchVolumeUsage(m.dc, newVol),
 				)
 			}
 
@@ -265,6 +316,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	prevContainer := m.selectedName
 	prevNetwork := m.selectedNetworkName
 	prevImgID := m.selectedImageID
+	prevVol := m.selectedVolume
 	var cmd tea.Cmd
 	m.pane, cmd = m.pane.Update(msg)
 
@@ -274,6 +326,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selectedNetworkName = ""
 		m.selectedImageID = ""
 		m.imageLayers = nil
+		m.selectedVolume = ""
+		m.selectedVolumeObj = nil
+		m.volumeFileUsage = nil
 		m.logAutoScroll = true
 		return m, tea.Batch(cmd,
 			fetchLogs(m.dc, newContainer),
@@ -301,6 +356,21 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fetchImageHistory(m.dc, newImgID),
 		)
 	}
+
+	// Check for volume selection change
+	newVol := m.pane.SelectedVolume()
+	if newVol != "" && newVol != prevVol {
+		m.selectedVolume = newVol
+		m.selectedName = ""
+		m.logAutoScroll = true
+		m.logLines = nil
+		m.volumeUsageErr = nil
+		m.selectedVolumeObj = m.pane.FindVolume(newVol)
+		return m, tea.Batch(cmd,
+			fetchVolumeUsage(m.dc, newVol),
+		)
+	}
+
 	return m, cmd
 }
 
@@ -362,6 +432,17 @@ func (m AppModel) View() string {
 				Foreground(m.theme.TabInactive).
 				Render("No image selected\n\n[2 to focus]")
 		}
+	} else if m.pane.ActiveTab() == 2 {
+		// Volumes tab
+		if m.selectedVolumeObj != nil {
+			rightContent = m.renderVolumeOverview(innerW, innerH, m.selectedVolumeObj)
+		} else {
+			rightContent = lipgloss.NewStyle().
+				Width(innerW).Height(innerH).
+				Align(lipgloss.Center, lipgloss.Center).
+				Foreground(m.theme.TabInactive).
+				Render("No volume selected\n\n[2 to focus]")
+		}
 	} else {
 		// Container overview
 		ctr := m.pane.GetSelectedContainer()
@@ -409,6 +490,8 @@ func (m AppModel) View() string {
 			bottomView = bottomStyle.Render(m.renderNetworkDetail(bottomW, bottomH))
 		} else if m.pane.ActiveTabKey() == 'i' && len(m.imageLayers) > 0 {
 			bottomView = bottomStyle.Render(m.renderImageLayers(bottomW, bottomH))
+		} else if m.pane.ActiveTab() == 2 && m.selectedVolume != "" {
+			bottomView = bottomStyle.Render(m.renderVolumeFileUsage(bottomW, bottomH))
 		} else {
 			bottomView = bottomStyle.Render(m.renderLogs(bottomW, bottomH))
 		}
@@ -1134,6 +1217,181 @@ func (m *AppModel) scrollLogsUpHalf() {
 	}
 }
 
+// ── Volume overview ─────────────────────────────────────────────
+
+// renderVolumeOverview draws the volume details pane (right side)
+// when the volumes tab is active.
+func (m AppModel) renderVolumeOverview(width, height int, vol *docker.Volume) string {
+	if width < 10 || height < 3 {
+		return ""
+	}
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TabInactive).
+		Width(12)
+
+	valueStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Foreground).
+		Width(width - 14)
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TitleText).
+		Bold(true).
+		Width(width)
+
+	divider := lipgloss.NewStyle().
+		Foreground(m.theme.DividerLine).
+		Render(strings.Repeat("─", width))
+
+	row := func(label, value string) string {
+		l := labelStyle.Render(label)
+		v := valueStyle.Render(value)
+		return l + v
+	}
+
+	var b strings.Builder
+
+	// Title
+	b.WriteString(titleStyle.Render(truncateStr(vol.Name, 30)))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// Fields
+	b.WriteString(row("Driver:", vol.Driver))
+	b.WriteString("\n")
+	b.WriteString(row("Mountpoint:", vol.Mountpoint))
+	b.WriteString("\n")
+	b.WriteString(row("Size:", vol.Size))
+	b.WriteString("\n")
+
+	// File count
+	if len(m.volumeFileUsage) > 0 {
+		b.WriteString(row("Files:", fmt.Sprintf("%d items", len(m.volumeFileUsage))))
+		b.WriteString("\n")
+	}
+
+	result := b.String()
+	lines := strings.Split(result, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// ── Volume file usage (bottom pane) ─────────────────────────────
+
+// renderVolumeFileUsage draws the per-file/folder disk usage inside
+// a volume in the bottom pane.
+func (m AppModel) renderVolumeFileUsage(width, height int) string {
+	if width < 1 || height < 1 {
+		return ""
+	}
+
+	if m.selectedVolume == "" {
+		return lipgloss.NewStyle().
+			Width(width).Height(height).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(m.theme.TabInactive).
+			Render("Select a volume to view file usage")
+	}
+
+	if len(m.volumeFileUsage) == 0 {
+		if m.volumeUsageErr != nil {
+			return lipgloss.NewStyle().
+				Width(width).Height(height).
+				Align(lipgloss.Center, lipgloss.Center).
+				Foreground(m.theme.StatusStopped).
+				Render(fmt.Sprintf("Error: %v", m.volumeUsageErr))
+		}
+		return lipgloss.NewStyle().
+			Width(width).Height(height).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(m.theme.TabInactive).
+			Render("Loading file usage...")
+	}
+
+	// Title
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TitleText).
+		Bold(true)
+
+	header := titleStyle.Render(fmt.Sprintf("📁 %s", truncateStr(m.selectedVolume, width-4)))
+
+	divider := lipgloss.NewStyle().
+		Foreground(m.theme.DividerLine).
+		Render(strings.Repeat("─", width))
+
+	// Column headers
+	nameHdr := lipgloss.NewStyle().
+		Foreground(m.theme.TableHeader).
+		Bold(true).
+		Width(width - 12).
+		Render("NAME")
+
+	sizeHdr := lipgloss.NewStyle().
+		Foreground(m.theme.TableHeader).
+		Bold(true).
+		Width(10).
+		Render("SIZE")
+
+	colHeader := nameHdr + "  " + sizeHdr
+
+	// Render file entries
+	dirStyle := lipgloss.NewStyle().Foreground(m.theme.TabActive).Bold(true)
+	fileStyle := lipgloss.NewStyle().Foreground(m.theme.Foreground)
+	sizeStyle := lipgloss.NewStyle().Foreground(m.theme.TabInactive)
+	dimStyle := lipgloss.NewStyle().Foreground(m.theme.TabInactive)
+
+	maxEntries := height - 3 // minus title, divider, col header
+	if maxEntries < 1 {
+		maxEntries = 1
+	}
+
+	var lines []string
+	lines = append(lines, header)
+	lines = append(lines, divider)
+	lines = append(lines, colHeader)
+
+	for i, entry := range m.volumeFileUsage {
+		if i >= maxEntries {
+			remaining := len(m.volumeFileUsage) - maxEntries
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("  ... and %d more items", remaining)))
+			break
+		}
+
+		name := entry.Name
+		if entry.IsDir {
+			name += "/"
+		}
+
+		nameCol := lipgloss.NewStyle().Width(width - 12)
+		if entry.IsDir {
+			nameCol = nameCol.Inherit(dirStyle)
+		} else {
+			nameCol = nameCol.Inherit(fileStyle)
+		}
+
+		szCol := sizeStyle.Width(10)
+
+		nameRendered := nameCol.Render(truncateStr(name, width-14))
+		szRendered := szCol.Render(entry.Size)
+
+		lines = append(lines, nameRendered+"  "+szRendered)
+	}
+
+	// Pad to height
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 // truncateStr truncates a string to at most n characters, appending
@@ -1226,5 +1484,14 @@ func fetchNetworkInspect(dc *docker.Client, name string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := dc.InspectNetworkRaw(name)
 		return networkInspectLoadedMsg{name: name, json: raw, err: err}
+	}
+}
+
+// fetchVolumeUsage returns a command that fetches the per-file/folder
+// disk usage inside a Docker volume.
+func fetchVolumeUsage(dc *docker.Client, volumeName string) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := dc.GetVolumeFileUsage(volumeName)
+		return volumeUsageLoadedMsg{volumeName: volumeName, entries: entries, err: err}
 	}
 }

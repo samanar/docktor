@@ -95,6 +95,12 @@ type networkActionExecutedMsg struct {
 	err    error
 }
 
+// volumesLoadedMsg is sent when Docker volumes have been fetched.
+type volumesLoadedMsg struct {
+	volumes []docker.Volume
+	err     error
+}
+
 // ── Tab ──────────────────────────────────────────────────────────
 
 // Tab represents a single tab in the pane's tab bar.
@@ -150,6 +156,10 @@ type Pane struct {
 
 	// ── Image data ───────────────────────────────────
 	images []docker.Image
+
+	// ── Volume data ──────────────────────────────────
+	volumes        []docker.Volume
+	volumesLoading bool
 
 	// ── Collapsible groups ───────────────────────────
 	collapsedGroups map[string]bool
@@ -331,6 +341,16 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		}
 		return p, nil
 
+	// ── Volume data arrived ───────────────────────────
+	case volumesLoadedMsg:
+		p.volumesLoading = false
+		if msg.err == nil {
+			p.volumes = msg.volumes
+			p.buildAndSetVolumeRows()
+			p.recalcTable()
+		}
+		return p, nil
+
 	// ── Stats refresh cycle ───────────────────────────
 	case statsTickMsg:
 		if p.ActiveTabKey() != 'c' {
@@ -355,7 +375,7 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 	// ── Spinner animation ─────────────────────────────
 	case spinnerTickMsg:
-		if p.loading {
+		if p.loading || p.volumesLoading {
 			p.spinnerIdx = (p.spinnerIdx + 1) % len(spinnerFrames)
 			return p, spinnerTick()
 		}
@@ -399,7 +419,7 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 		// ── Not in search mode ─────────────────────────
 		// Block navigation while loading
-		if p.loading {
+		if p.loading || p.volumesLoading {
 			return p, nil
 		}
 
@@ -542,9 +562,13 @@ func (p Pane) View() string {
 	}
 	var contentArea string
 	if p.loading {
-		contentArea = p.renderLoading(innerW, contentH)
-	} else if len(p.groups) == 0 {
-		contentArea = p.renderEmpty(innerW, contentH)
+		contentArea = p.renderLoading(innerW, contentH, "Loading containers...")
+	} else if p.volumesLoading {
+		contentArea = p.renderLoading(innerW, contentH, "Loading volumes...")
+	} else if p.activeTab == 2 && len(p.volumes) == 0 {
+		contentArea = p.renderEmpty(innerW, contentH, "No volumes found.")
+	} else if len(p.groups) == 0 && len(p.volumes) == 0 {
+		contentArea = p.renderEmpty(innerW, contentH, "No containers found.")
 	} else {
 		contentArea = padLines(p.table.View(), innerW, 2)
 	}
@@ -767,6 +791,15 @@ func (p *Pane) switchTab(key rune) tea.Cmd {
 			spinnerTick(),
 		)
 
+	case 'v':
+		// Swap to volume columns and actions
+		p.volumesLoading = true
+		p.table = p.table.WithRows(nil) // clear rows while loading
+		return tea.Batch(
+			fetchVolumes(p.dockerClient),
+			spinnerTick(),
+		)
+
 	default:
 		// Swap back to container columns and actions
 		p.table = p.table.WithColumns(containerColumns())
@@ -779,14 +812,46 @@ func (p *Pane) switchTab(key rune) tea.Cmd {
 }
 
 // SelectedContainer returns the full Docker name of the currently
-// highlighted container, or empty string if a group header is selected.
+// highlighted container, or empty string if a group header is selected
+// or if the containers tab is not active.
 func (p Pane) SelectedContainer() string {
+	if p.activeTab != 0 {
+		return ""
+	}
 	sel := p.table.HighlightedRow()
 	if p.table.RowTypeAt(sel) != RowData {
 		return ""
 	}
 	name, _ := p.table.GetCell(sel, colOriginalName)
 	return name
+}
+
+// SelectedVolume returns the name of the currently highlighted volume,
+// or empty string if nothing is selected or not on the volumes tab.
+func (p Pane) SelectedVolume() string {
+	if p.activeTab != 2 {
+		return ""
+	}
+	sel := p.table.HighlightedRow()
+	if p.table.RowTypeAt(sel) != RowData {
+		return ""
+	}
+	name, _ := p.table.GetCell(sel, colOriginalName)
+	return name
+}
+
+// ActiveTab returns the index of the currently active tab.
+func (p Pane) ActiveTab() int { return p.activeTab }
+
+// FindVolume returns a pointer to the Volume with the given name,
+// or nil if not found.
+func (p Pane) FindVolume(name string) *docker.Volume {
+	for i := range p.volumes {
+		if p.volumes[i].Name == name {
+			return &p.volumes[i]
+		}
+	}
+	return nil
 }
 
 // GetSelectedContainer returns the full Container object for the
@@ -844,11 +909,6 @@ func (p *Pane) rebuildImageRows() {
 	if len(rows) > 0 && p.table.HighlightedRow() < 0 {
 		p.table.SelectFirst()
 	}
-}
-
-// ActiveTab returns the index of the currently active tab.
-func (p Pane) ActiveTab() int {
-	return p.activeTab
 }
 
 // ActiveTabKey returns the key of the currently active tab.
@@ -1109,6 +1169,17 @@ func networkColumns() []ColumnDef {
 	}
 }
 
+// volumeColumns returns the column definitions for the volumes table.
+func volumeColumns() []ColumnDef {
+	return []ColumnDef{
+		{Key: colIcon, Title: "", Width: 2},
+		{Key: colName, Title: "VOLUME NAME", Width: 30},
+		{Key: "driver", Title: "DRIVER", Width: 10},
+		{Key: "mountpoint", Title: "MOUNTPOINT", Width: 0}, // flex
+		{Key: "size", Title: "SIZE", Width: 10},
+	}
+}
+
 // buildTableRows converts Docker container groups into table Rows
 // with status dots, Docker-style coloring, collapsible groups, and
 // visual separators between groups.
@@ -1306,6 +1377,30 @@ func buildNetworkRows(theme Theme, groups []docker.NetworkGroup, collapsed map[s
 	return rows
 }
 
+// buildVolumeRows converts Docker volumes into table rows.
+func buildVolumeRows(theme Theme, volumes []docker.Volume) []Row {
+	bodyStyle := lipgloss.NewStyle().Foreground(theme.Foreground)
+	dimStyle := lipgloss.NewStyle().Foreground(theme.TabInactive)
+	iconVol := lipgloss.NewStyle().Foreground(theme.TabActive)
+
+	var rows []Row
+	for _, v := range volumes {
+		row := Row{
+			Cells: map[string]Cell{
+				colIcon:         {Value: "⬡", Style: iconVol},
+				colName:         {Value: v.Name, Style: bodyStyle},
+				colOriginalName: {Value: v.Name},
+				"driver":        {Value: v.Driver, Style: dimStyle},
+				"mountpoint":    {Value: v.Mountpoint, Style: dimStyle},
+				"size":          {Value: v.Size, Style: bodyStyle},
+			},
+			Type: RowData,
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
 // rebuildTableRows rebuilds rows from groups, filtering collapsed
 // groups, and updates the table while preserving selection.
 // The exact row set depends on the active tab.
@@ -1321,6 +1416,120 @@ func (p *Pane) rebuildTableRows() {
 	p.table = p.table.WithRows(rows)
 	if len(rows) > 0 && p.table.HighlightedRow() < 0 {
 		p.table.SelectFirst()
+	}
+}
+
+// buildAndSetVolumeRows rebuilds the table with volume rows.
+func (p *Pane) buildAndSetVolumeRows() {
+	cols := volumeColumns()
+	tbl := NewTable(cols).
+		WithBaseStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.Foreground).
+				Background(p.theme.Background),
+		).
+		WithHeaderStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.TableHeader).
+				Background(p.theme.TabBarBackground).
+				Bold(true),
+		).
+		WithSelectedStyle(
+			lipgloss.NewStyle().
+				Background(p.theme.RowSelected).
+				Bold(true),
+		).
+		WithDividerStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.DividerLine),
+		).
+		WithSepStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.DividerLine),
+		).
+		WithHighlightColumn(1,
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("15")).
+				Bold(true),
+		).
+		Focused(p.focused)
+
+	rows := buildVolumeRows(p.theme, p.volumes)
+	tbl = tbl.WithRows(rows)
+	if len(rows) > 0 && tbl.HighlightedRow() < 0 {
+		tbl.SelectFirst()
+	}
+
+	// Preserve width/height that were already set
+	if p.table.width > 0 {
+		tbl.SetWidth(p.table.width)
+	}
+	if p.table.height > 0 {
+		tbl.SetHeight(p.table.height)
+	}
+
+	p.table = tbl
+}
+
+// buildContainerTable rebuilds the table with container columns and rows.
+func (p *Pane) buildContainerTable() {
+	cols := containerColumns()
+	tbl := NewTable(cols).
+		WithBaseStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.Foreground).
+				Background(p.theme.Background),
+		).
+		WithHeaderStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.TableHeader).
+				Background(p.theme.TabBarBackground).
+				Bold(true),
+		).
+		WithSelectedStyle(
+			lipgloss.NewStyle().
+				Background(p.theme.RowSelected).
+				Bold(true),
+		).
+		WithDividerStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.DividerLine),
+		).
+		WithSepStyle(
+			lipgloss.NewStyle().
+				Foreground(p.theme.DividerLine),
+		).
+		WithHighlightColumn(1,
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("15")).
+				Bold(true),
+		).
+		Focused(true)
+
+	// Preserve width/height
+	w, h := p.table.width, p.table.height
+	tbl.SetWidth(w)
+	tbl.SetHeight(h)
+
+	p.table = tbl
+	p.rebuildTableRows()
+}
+
+// switchToTab switches the active tab and updates the table accordingly.
+func (p *Pane) switchToTab(tabIdx int) {
+	if tabIdx == p.activeTab {
+		return
+	}
+	p.activeTab = tabIdx
+
+	switch tabIdx {
+	case 0: // Containers
+		p.buildContainerTable()
+	case 2: // Volumes
+		p.volumesLoading = true
+		p.table = p.table.WithRows(nil) // clear rows while loading
+	default:
+		// Images, Networks — placeholder for now, keep container table
 	}
 }
 
@@ -1486,34 +1695,34 @@ func shortenName(name string) string {
 
 // ── Loading / empty renderers ────────────────────────────────────
 
-// renderLoading draws a centred spinner + message while containers
-// are being fetched.
-func (p Pane) renderLoading(width, height int) string {
+// renderLoading draws a centred spinner + message while data
+// is being fetched.
+func (p Pane) renderLoading(width, height int, msg string) string {
 	spinner := spinnerFrames[p.spinnerIdx]
-	msg := lipgloss.NewStyle().
+	text := lipgloss.NewStyle().
 		Foreground(p.theme.Foreground).
-		Render(spinner + "  Loading containers...")
+		Render(spinner + "  " + msg)
 
 	return lipgloss.NewStyle().
 		Width(width).
 		Height(height).
 		Background(p.theme.Background).
 		Align(lipgloss.Center, lipgloss.Center).
-		Render(msg)
+		Render(text)
 }
 
-// renderEmpty draws a centred message when no containers were found.
-func (p Pane) renderEmpty(width, height int) string {
-	msg := lipgloss.NewStyle().
+// renderEmpty draws a centred message when no data was found.
+func (p Pane) renderEmpty(width, height int, msg string) string {
+	text := lipgloss.NewStyle().
 		Foreground(p.theme.TabInactive).
-		Render("No containers found.")
+		Render(msg)
 
 	return lipgloss.NewStyle().
 		Width(width).
 		Height(height).
 		Background(p.theme.Background).
 		Align(lipgloss.Center, lipgloss.Center).
-		Render(msg)
+		Render(text)
 }
 
 // ── Bubble Tea commands ──────────────────────────────────────────
@@ -1593,5 +1802,14 @@ func fetchStats(dc *docker.Client) tea.Cmd {
 	return func() tea.Msg {
 		stats, err := dc.GetStats()
 		return statsRefreshMsg{stats: stats, err: err}
+	}
+}
+
+// fetchVolumes returns a command that asynchronously fetches Docker
+// volumes with their driver, mountpoint, and size information.
+func fetchVolumes(dc *docker.Client) tea.Cmd {
+	return func() tea.Msg {
+		volumes, err := dc.GetVolumes()
+		return volumesLoadedMsg{volumes: volumes, err: err}
 	}
 }
