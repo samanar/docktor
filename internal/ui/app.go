@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -24,7 +25,7 @@ type AppModel struct {
 	// Focus: 1 = navigator, 2 = overview, 3 = logs
 	focus int
 
-	// Log viewer state
+	// Log / detail viewer state
 	logLines      []string
 	logScrollOff  int
 	logAutoScroll bool
@@ -33,6 +34,12 @@ type AppModel struct {
 	// Image layer viewer state
 	imageLayers    []docker.ImageLayer
 	selectedImageID string
+
+	// Network detail state
+	selectedNetworkName    string
+	networkDetailLines     []string
+	networkDetailScrollOff int
+	networkDetailAutoScroll bool
 }
 
 // NewApp creates the root application model with the given theme.
@@ -119,6 +126,21 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	// ── Network inspect arrived ──────────────────────
+	case networkInspectLoadedMsg:
+		if msg.name == m.selectedNetworkName && msg.err == nil {
+			m.buildNetworkDetail(msg.name, msg.json)
+			if m.networkDetailAutoScroll {
+				m.scrollNetworkDetailToEnd()
+			}
+		}
+		return m, nil
+
+	// ── Network action completed ─────────────────────
+	case networkActionExecutedMsg:
+		// Refresh pane after network prune
+		return m, m.pane.Init()
+
 	// ── Keyboard ─────────────────────────────────────
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -148,21 +170,34 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// ── Pane navigation (focus 1) ─────────────────
 		if m.focus == 1 {
-			prevName := m.selectedName
+			prevContainer := m.selectedName
+			prevNetwork := m.selectedNetworkName
 			prevImgID := m.selectedImageID
 			var cmd tea.Cmd
 			m.pane, cmd = m.pane.Update(msg)
 
-			// Check container selection
-			newName := m.pane.SelectedContainer()
-			if newName != "" && newName != prevName {
-				m.selectedName = newName
+			// Check for container selection change
+			newContainer := m.pane.SelectedContainer()
+			if newContainer != "" && newContainer != prevContainer {
+				m.selectedName = newContainer
+				m.selectedNetworkName = ""
 				m.selectedImageID = ""
 				m.imageLayers = nil
 				m.logAutoScroll = true
 				return m, tea.Batch(cmd,
-					fetchLogs(m.dc, newName),
-					fetchDiskUsage(m.dc, newName),
+					fetchLogs(m.dc, newContainer),
+					fetchDiskUsage(m.dc, newContainer),
+				)
+			}
+
+			// Check for network selection change
+			newNetwork := m.pane.SelectedNetwork()
+			if newNetwork != "" && newNetwork != prevNetwork {
+				m.selectedNetworkName = newNetwork
+				m.selectedName = ""
+				m.networkDetailAutoScroll = true
+				return m, tea.Batch(cmd,
+					fetchNetworkInspect(m.dc, newNetwork),
 				)
 			}
 
@@ -181,23 +216,44 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-		// ── Log scrolling (focus 3) ───────────────────
+		// ── Log / detail scrolling (focus 3) ───────────
 		if m.focus == 3 {
-			switch msg.String() {
-			case "j", "down":
-				m.scrollLogsDown()
-			case "k", "up":
-				m.scrollLogsUp()
-			case "g":
-				m.logScrollOff = 0
-				m.logAutoScroll = false
-			case "G":
-				m.logAutoScroll = true
-				m.scrollLogsToEnd()
-			case "ctrl+d":
-				m.scrollLogsDownHalf()
-			case "ctrl+u":
-				m.scrollLogsUpHalf()
+			if m.pane.ActiveTabKey() == 'N' {
+				// Network detail scrolling
+				switch msg.String() {
+				case "j", "down":
+					m.scrollNetworkDetailDown()
+				case "k", "up":
+					m.scrollNetworkDetailUp()
+				case "g":
+					m.networkDetailScrollOff = 0
+					m.networkDetailAutoScroll = false
+				case "G":
+					m.networkDetailAutoScroll = true
+					m.scrollNetworkDetailToEnd()
+				case "ctrl+d":
+					m.scrollNetworkDetailDownHalf()
+				case "ctrl+u":
+					m.scrollNetworkDetailUpHalf()
+				}
+			} else {
+				// Container log scrolling
+				switch msg.String() {
+				case "j", "down":
+					m.scrollLogsDown()
+				case "k", "up":
+					m.scrollLogsUp()
+				case "g":
+					m.logScrollOff = 0
+					m.logAutoScroll = false
+				case "G":
+					m.logAutoScroll = true
+					m.scrollLogsToEnd()
+				case "ctrl+d":
+					m.scrollLogsDownHalf()
+				case "ctrl+u":
+					m.scrollLogsUpHalf()
+				}
 			}
 			return m, nil
 		}
@@ -206,20 +262,32 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── All other messages → pane (stats, data, etc.) ─
-	prevName := m.selectedName
+	prevContainer := m.selectedName
+	prevNetwork := m.selectedNetworkName
 	prevImgID := m.selectedImageID
 	var cmd tea.Cmd
 	m.pane, cmd = m.pane.Update(msg)
 
-	newName := m.pane.SelectedContainer()
-	if newName != "" && newName != prevName {
-		m.selectedName = newName
+	newContainer := m.pane.SelectedContainer()
+	if newContainer != "" && newContainer != prevContainer {
+		m.selectedName = newContainer
+		m.selectedNetworkName = ""
 		m.selectedImageID = ""
 		m.imageLayers = nil
 		m.logAutoScroll = true
 		return m, tea.Batch(cmd,
-			fetchLogs(m.dc, newName),
-			fetchDiskUsage(m.dc, newName),
+			fetchLogs(m.dc, newContainer),
+			fetchDiskUsage(m.dc, newContainer),
+		)
+	}
+
+	newNetwork := m.pane.SelectedNetwork()
+	if newNetwork != "" && newNetwork != prevNetwork {
+		m.selectedNetworkName = newNetwork
+		m.selectedName = ""
+		m.networkDetailAutoScroll = true
+		return m, tea.Batch(cmd,
+			fetchNetworkInspect(m.dc, newNetwork),
 		)
 	}
 
@@ -270,18 +338,42 @@ func (m AppModel) View() string {
 	innerH := paneHeight - 2
 	var rightContent string
 
-	ctr := m.pane.GetSelectedContainer()
-	img := m.pane.GetSelectedImage()
-	if ctr != nil {
-		rightContent = m.renderOverview(innerW, innerH, ctr)
-	} else if img != nil {
-		rightContent = m.renderImageOverview(innerW, innerH, img)
+	if m.pane.ActiveTabKey() == 'N' {
+		// Network overview
+		nw := m.pane.GetSelectedNetwork()
+		if nw != nil {
+			rightContent = m.renderNetworkOverview(innerW, innerH, nw)
+		} else {
+			rightContent = lipgloss.NewStyle().
+				Width(innerW).Height(innerH).
+				Align(lipgloss.Center, lipgloss.Center).
+				Foreground(m.theme.TabInactive).
+				Render("No network selected\n\n[2 to focus]")
+		}
+	} else if m.pane.ActiveTabKey() == 'i' {
+		// Image overview
+		img := m.pane.GetSelectedImage()
+		if img != nil {
+			rightContent = m.renderImageOverview(innerW, innerH, img)
+		} else {
+			rightContent = lipgloss.NewStyle().
+				Width(innerW).Height(innerH).
+				Align(lipgloss.Center, lipgloss.Center).
+				Foreground(m.theme.TabInactive).
+				Render("No image selected\n\n[2 to focus]")
+		}
 	} else {
-		rightContent = lipgloss.NewStyle().
-			Width(innerW).Height(innerH).
-			Align(lipgloss.Center, lipgloss.Center).
-			Foreground(m.theme.TabInactive).
-			Render("No container selected\n\n[2 to focus]")
+		// Container overview
+		ctr := m.pane.GetSelectedContainer()
+		if ctr != nil {
+			rightContent = m.renderOverview(innerW, innerH, ctr)
+		} else {
+			rightContent = lipgloss.NewStyle().
+				Width(innerW).Height(innerH).
+				Align(lipgloss.Center, lipgloss.Center).
+				Foreground(m.theme.TabInactive).
+				Render("No container selected\n\n[2 to focus]")
+		}
 	}
 
 	rightStyle := lipgloss.NewStyle().
@@ -294,7 +386,7 @@ func (m AppModel) View() string {
 
 	rightView := rightStyle.Render(rightContent)
 
-	// ── Bottom pane (logs / image layers) ─────────────
+	// ── Bottom pane (logs / detail) ──────────────────
 	bottomHeight := m.height - paneHeight
 	var bottomView string
 	if bottomHeight > 0 {
@@ -310,11 +402,15 @@ func (m AppModel) View() string {
 			BorderForeground(bottomBorder).
 			Background(m.theme.Background)
 
-		// Show image layers or container logs
-		if len(m.imageLayers) > 0 {
-			bottomView = bottomStyle.Render(m.renderImageLayers(m.width-2, bottomHeight-2))
+		bottomW := m.width - 2
+		bottomH := bottomHeight - 2
+
+		if m.pane.ActiveTabKey() == 'N' {
+			bottomView = bottomStyle.Render(m.renderNetworkDetail(bottomW, bottomH))
+		} else if m.pane.ActiveTabKey() == 'i' && len(m.imageLayers) > 0 {
+			bottomView = bottomStyle.Render(m.renderImageLayers(bottomW, bottomH))
 		} else {
-			bottomView = bottomStyle.Render(m.renderLogs(m.width-2, bottomHeight-2))
+			bottomView = bottomStyle.Render(m.renderLogs(bottomW, bottomH))
 		}
 	}
 
@@ -378,7 +474,334 @@ func (m AppModel) renderLogs(width, height int) string {
 	return strings.Join(styled, "\n")
 }
 
-// ── Overview pane ────────────────────────────────────────────────
+// ── Network overview pane ────────────────────────────────────────
+
+func (m AppModel) renderNetworkOverview(width, height int, nw *docker.Network) string {
+	if width < 10 || height < 3 {
+		return ""
+	}
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TabInactive).
+		Width(14)
+
+	valueStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Foreground).
+		Width(width - 16)
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TitleText).
+		Bold(true).
+		Width(width)
+
+	divider := lipgloss.NewStyle().
+		Foreground(m.theme.DividerLine).
+		Render(strings.Repeat("─", width))
+
+	row := func(label, value string) string {
+		l := labelStyle.Render(label)
+		v := valueStyle.Render(value)
+		return l + v
+	}
+
+	// Boolean badge: green ✓ or grey ✗
+	boolStyle := func(v bool) lipgloss.Style {
+		if v {
+			return lipgloss.NewStyle().Foreground(m.theme.StatusRunning)
+		}
+		return lipgloss.NewStyle().Foreground(m.theme.TabInactive)
+	}
+
+	var b strings.Builder
+
+	// Title
+	b.WriteString(titleStyle.Render(nw.Name))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// Fields
+	b.WriteString(row("ID:", truncateStr(nw.ID, 40)))
+	b.WriteString("\n")
+	b.WriteString(row("Driver:", nw.Driver))
+	b.WriteString("\n")
+	b.WriteString(row("Scope:", nw.Scope))
+	b.WriteString("\n")
+
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// IPAM section
+	b.WriteString(titleStyle.Render("IPAM"))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	if nw.Subnet != "" {
+		b.WriteString(row("Subnet:", nw.Subnet))
+		b.WriteString("\n")
+	}
+	if nw.Gateway != "" {
+		b.WriteString(row("Gateway:", nw.Gateway))
+		b.WriteString("\n")
+	}
+	if nw.IPRange != "" {
+		b.WriteString(row("IP Range:", nw.IPRange))
+		b.WriteString("\n")
+	}
+	if nw.Subnet == "" && nw.Gateway == "" {
+		b.WriteString(row("", "(no IPAM config)"))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// Flags section
+	b.WriteString(titleStyle.Render("Flags"))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	internalStr := boolStyle(nw.Internal).Render("✗")
+	if nw.Internal {
+		internalStr = boolStyle(true).Render("✓")
+	}
+	b.WriteString(row("Internal:", internalStr))
+	b.WriteString("\n")
+
+	ipv6Str := boolStyle(nw.IPv6).Render("✗")
+	if nw.IPv6 {
+		ipv6Str = boolStyle(true).Render("✓")
+	}
+	b.WriteString(row("IPv6:", ipv6Str))
+	b.WriteString("\n")
+
+	attachStr := boolStyle(nw.Attachable).Render("✗")
+	if nw.Attachable {
+		attachStr = boolStyle(true).Render("✓")
+	}
+	b.WriteString(row("Attachable:", attachStr))
+	b.WriteString("\n")
+
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// Summary
+	b.WriteString(titleStyle.Render("Summary"))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	b.WriteString(row("Containers:", fmt.Sprintf("%d connected", len(nw.Containers))))
+	b.WriteString("\n")
+	if nw.Created != "" {
+		b.WriteString(row("Created:", relativeTime(nw.Created)))
+		b.WriteString("\n")
+	}
+
+	// Labels
+	if len(nw.Labels) > 0 {
+		b.WriteString("\n")
+		b.WriteString(titleStyle.Render("Labels"))
+		b.WriteString("\n")
+		b.WriteString(divider)
+		b.WriteString("\n\n")
+		for k, v := range nw.Labels {
+			b.WriteString(row(k+":", v))
+			b.WriteString("\n")
+		}
+	}
+
+	result := b.String()
+	lines := strings.Split(result, "\n")
+
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// ── Network detail pane (bottom) ──────────────────────────────────
+
+// buildNetworkDetail constructs the combined scrollable content
+// for the bottom pane: connected containers table + JSON inspect.
+func (m *AppModel) buildNetworkDetail(name string, rawJSON string) {
+	var lines []string
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TitleText).
+		Bold(true)
+
+	divider := strings.Repeat("─", 60)
+
+	// Find the network to list connected containers
+	var nw *docker.Network
+	for _, g := range m.pane.networks {
+		for i := range g.Networks {
+			if g.Networks[i].Name == name {
+				nw = &g.Networks[i]
+				break
+			}
+		}
+	}
+
+	// ── Connected containers section ─────────────────
+	lines = append(lines, titleStyle.Render("CONNECTED CONTAINERS"))
+	lines = append(lines, divider)
+
+	if nw != nil && len(nw.Containers) > 0 {
+		// Mini table: NAME  |  IPv4  |  MAC
+		header := fmt.Sprintf("%-30s %-20s %-18s", "NAME", "IPv4", "MAC")
+		lines = append(lines, header)
+		lines = append(lines, strings.Repeat("─", 68))
+
+		for _, ctr := range nw.Containers {
+			name := ctr.Name
+			if len(name) > 30 {
+				name = name[:29] + "…"
+			}
+			line := fmt.Sprintf("%-30s %-20s %-18s", name, ctr.IPv4Addr, ctr.MACAddr)
+			lines = append(lines, line)
+		}
+	} else {
+		lines = append(lines, "(no containers connected)")
+	}
+
+	// ── JSON inspect section ─────────────────────────
+	lines = append(lines, "")
+	lines = append(lines, titleStyle.Render("INSPECT JSON"))
+	lines = append(lines, divider)
+
+	// Append raw JSON lines
+	for _, l := range strings.Split(rawJSON, "\n") {
+		lines = append(lines, l)
+	}
+
+	m.networkDetailLines = lines
+}
+
+// renderNetworkDetail renders the scrollable network detail pane.
+func (m AppModel) renderNetworkDetail(width, height int) string {
+	if width < 1 || height < 1 {
+		return ""
+	}
+
+	if m.selectedNetworkName == "" {
+		return lipgloss.NewStyle().
+			Width(width).Height(height).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(m.theme.TabInactive).
+			Render("Select a network to view details")
+	}
+
+	if len(m.networkDetailLines) == 0 {
+		return lipgloss.NewStyle().
+			Width(width).Height(height).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(m.theme.TabInactive).
+			Render("Loading network details…")
+	}
+
+	// Clamp scroll offset
+	maxOff := len(m.networkDetailLines) - height
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.networkDetailScrollOff > maxOff {
+		m.networkDetailScrollOff = maxOff
+	}
+	if m.networkDetailScrollOff < 0 {
+		m.networkDetailScrollOff = 0
+	}
+
+	end := m.networkDetailScrollOff + height
+	if end > len(m.networkDetailLines) {
+		end = len(m.networkDetailLines)
+	}
+
+	visible := m.networkDetailLines[m.networkDetailScrollOff:end]
+	for len(visible) < height {
+		visible = append(visible, "")
+	}
+
+	lineStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Foreground).
+		Width(width)
+
+	var styled []string
+	for _, line := range visible {
+		styled = append(styled, lineStyle.Render(line))
+	}
+
+	return strings.Join(styled, "\n")
+}
+
+// ── Network detail scrolling ──────────────────────────────────────
+
+func (m *AppModel) scrollNetworkDetailToEnd() {
+	visible := len(m.networkDetailLines)
+	if visible == 0 {
+		m.networkDetailScrollOff = 0
+		return
+	}
+	avail := m.logViewHeight()
+	m.networkDetailScrollOff = visible - avail
+	if m.networkDetailScrollOff < 0 {
+		m.networkDetailScrollOff = 0
+	}
+}
+
+func (m *AppModel) scrollNetworkDetailDown() {
+	maxOff := len(m.networkDetailLines) - 1
+	if m.networkDetailScrollOff < maxOff {
+		m.networkDetailScrollOff++
+	}
+	avail := m.logViewHeight()
+	if m.networkDetailScrollOff >= len(m.networkDetailLines)-avail {
+		m.networkDetailAutoScroll = true
+	}
+}
+
+func (m *AppModel) scrollNetworkDetailUp() {
+	m.networkDetailAutoScroll = false
+	if m.networkDetailScrollOff > 0 {
+		m.networkDetailScrollOff--
+	}
+}
+
+func (m *AppModel) scrollNetworkDetailDownHalf() {
+	avail := m.logViewHeight()
+	if avail < 6 {
+		avail = 6
+	}
+	half := avail / 2
+	maxOff := len(m.networkDetailLines) - 1
+	m.networkDetailScrollOff += half
+	if m.networkDetailScrollOff > maxOff {
+		m.networkDetailScrollOff = maxOff
+	}
+}
+
+func (m *AppModel) scrollNetworkDetailUpHalf() {
+	m.networkDetailAutoScroll = false
+	avail := m.logViewHeight()
+	if avail < 6 {
+		avail = 6
+	}
+	half := avail / 2
+	m.networkDetailScrollOff -= half
+	if m.networkDetailScrollOff < 0 {
+		m.networkDetailScrollOff = 0
+	}
+}
 
 func (m AppModel) renderOverview(width, height int, ctr *docker.Container) string {
 	if width < 10 || height < 3 {
@@ -794,5 +1217,14 @@ func fetchImageHistory(dc *docker.Client, imageID string) tea.Cmd {
 	return func() tea.Msg {
 		layers, err := dc.GetImageHistory(imageID)
 		return imageLayersLoadedMsg{imageID: imageID, layers: layers, err: err}
+	}
+}
+
+// fetchNetworkInspect returns a command that fetches the raw JSON
+// output of `docker network inspect` for the given network.
+func fetchNetworkInspect(dc *docker.Client, name string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := dc.InspectNetworkRaw(name)
+		return networkInspectLoadedMsg{name: name, json: raw, err: err}
 	}
 }

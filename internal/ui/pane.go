@@ -14,6 +14,7 @@ import (
 // ── Column keys ──────────────────────────────────────────────────
 
 const (
+	// Container columns
 	colIcon         = "icon"
 	colName         = "name"
 	colOriginalName = "originalName" // hidden — full Docker container name
@@ -22,6 +23,13 @@ const (
 	colPorts        = "ports"
 	colBuilt        = "built"
 	colRestarted    = "restarted"
+
+	// Network columns
+	colDriver     = "driver"
+	colScope      = "scope"
+	colSubnet     = "subnet"
+	colGateway    = "gateway"
+	colContainers = "containers"
 )
 
 // ── Spinner ──────────────────────────────────────────────────────
@@ -61,6 +69,29 @@ type actionExecutedMsg struct {
 // imagesLoadedMsg is sent when docker image list has been fetched.
 type imagesLoadedMsg struct {
 	images []docker.Image
+	err    error
+}
+
+// ── Network messages ─────────────────────────────────────────────
+
+// networksLoadedMsg is sent when network data has been fetched.
+type networksLoadedMsg struct {
+	groups []docker.NetworkGroup
+	err    error
+}
+
+// networkInspectLoadedMsg carries the raw JSON output of
+// `docker network inspect` for the selected network.
+type networkInspectLoadedMsg struct {
+	name string
+	json string
+	err  error
+}
+
+// networkActionExecutedMsg is sent after a network action
+// (inspect refresh, prune) completes.
+type networkActionExecutedMsg struct {
+	action string // "inspect", "prune"
 	err    error
 }
 
@@ -131,6 +162,29 @@ type Pane struct {
 
 	// ── Vim navigation ───────────────────────────────
 	pendingG bool // waiting for second 'g' for gg (go to top)
+
+	// ── Network state ────────────────────────────────
+	networks         []docker.NetworkGroup
+	networkLoading   bool
+	networkCollapsed map[string]bool
+}
+
+// ── Action sets per tab ──────────────────────────────────────────
+
+var containerActions = []Action{
+	{Key: 's', Label: "Start"},
+	{Key: 'x', Label: "Stop"},
+	{Key: 'r', Label: "Restart"},
+	{Key: 'K', Label: "Kill"},
+	{Key: '/', Label: "Filter"},
+	{Key: 'q', Label: "Quit"},
+}
+
+var networkActions = []Action{
+	{Key: 'I', Label: "Inspect"},
+	{Key: 'P', Label: "Prune"},
+	{Key: '/', Label: "Filter"},
+	{Key: 'q', Label: "Quit"},
 }
 
 // NewPane creates a new navigator pane with default tabs, actions,
@@ -197,17 +251,18 @@ func NewPane(theme Theme, dc *docker.Client) Pane {
 		Focused(true)
 
 	return Pane{
-		theme:           theme,
-		tabs:            tabs,
-		actions:         containerActions,
-		allActions:      allActions,
-		activeTab:       0,
-		focused:         true,
-		table:           tbl,
-		loading:         true,
-		spinnerIdx:      0,
-		dockerClient:    dc,
-		collapsedGroups: make(map[string]bool),
+		theme:            theme,
+		tabs:             tabs,
+		actions:          containerActions,
+		allActions:       allActions,
+		activeTab:        0,
+		focused:          true,
+		table:            tbl,
+		loading:          true,
+		spinnerIdx:       0,
+		dockerClient:     dc,
+		collapsedGroups:  make(map[string]bool),
+		networkCollapsed: make(map[string]bool),
 	}
 }
 
@@ -230,7 +285,34 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 			p.groups = msg.groups
 			p.rebuildTableRows()
 			p.recalcTable()
-			return p, statsTick()
+			// Only start stats loop if on containers tab
+			if p.ActiveTabKey() == 'c' {
+				return p, statsTick()
+			}
+		}
+		return p, nil
+
+	// ── Network data arrived ─────────────────────────
+	case networksLoadedMsg:
+		p.networkLoading = false
+		p.loading = false
+		if msg.err == nil {
+			p.networks = msg.groups
+			p.rebuildTableRows()
+			p.recalcTable()
+		}
+		return p, nil
+
+	// ── Network action completed ─────────────────────
+	case networkActionExecutedMsg:
+		if msg.action == "prune" {
+			// Refresh network list after pruning
+			p.networkLoading = true
+			p.loading = true
+			return p, tea.Batch(
+				fetchNetworks(p.dockerClient),
+				spinnerTick(),
+			)
 		}
 		return p, nil
 
@@ -246,13 +328,16 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 	// ── Stats refresh cycle ───────────────────────────
 	case statsTickMsg:
-		if p.activeTab == 0 {
-			return p, fetchStats(p.dockerClient)
+		if p.ActiveTabKey() != 'c' {
+			return p, nil
 		}
-		return p, nil
+		return p, fetchStats(p.dockerClient)
 
 	case statsRefreshMsg:
-		if msg.err == nil && p.activeTab == 0 {
+		if p.ActiveTabKey() != 'c' {
+			return p, nil
+		}
+		if msg.err == nil {
 			docker.MergeStats(p.groups, msg.stats)
 			sel := p.table.HighlightedRow()
 			gid := p.table.GroupIDAt(sel)
@@ -369,13 +454,16 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 			// Tab switching
 			case "c":
-				return p, p.switchTab(0)
+				p.switchTab('c')
+				return p, nil
 			case "i":
-				return p, p.switchTab(1)
+				p.switchTab('i')
+				return p, nil
 			case "v":
-				return p, p.switchTab(2)
+				p.switchTab('v')
+				return p, nil
 			case "N":
-				return p, p.switchTab(3)
+				return p, p.switchTab('N')
 
 			// Toggle group collapse (containers only)
 			case " ":
@@ -399,6 +487,16 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 			case "K":
 				if p.activeTab == 0 {
 					return p, p.doAction("kill", p.dockerClient.KillContainer)
+				}
+
+			// ── Network actions ────────────────────
+			case "I":
+				if p.ActiveTabKey() == 'N' {
+					return p, p.doNetworkAction("inspect")
+				}
+			case "P":
+				if p.ActiveTabKey() == 'N' {
+					return p, p.doNetworkAction("prune")
 				}
 
 			// Quit — delegated to AppModel
@@ -584,7 +682,11 @@ func (p *Pane) toggleGroup() {
 	sel := p.table.HighlightedRow()
 	if p.table.RowTypeAt(sel) == RowGroup {
 		gid := p.table.GroupIDAt(sel)
-		p.collapsedGroups[gid] = !p.collapsedGroups[gid]
+		if p.ActiveTabKey() == 'N' {
+			p.networkCollapsed[gid] = !p.networkCollapsed[gid]
+		} else {
+			p.collapsedGroups[gid] = !p.collapsedGroups[gid]
+		}
 		p.rebuildTableRows()
 		p.recalcTable()
 	}
@@ -625,6 +727,43 @@ func (p Pane) tabIndexByKey(key rune) int {
 		}
 	}
 	return p.activeTab
+}
+
+// switchTab changes the active tab and performs setup: swapping
+// column definitions, actions, and triggering data fetch if needed.
+// Returns a tea.Cmd to kick off async data loading, or nil.
+func (p *Pane) switchTab(key rune) tea.Cmd {
+	p.activeTab = p.tabIndexByKey(key)
+
+	switch key {
+	case 'N':
+		// Swap to network columns and actions
+		p.table = p.table.WithColumns(networkColumns())
+		p.actions = networkActions
+		// Trigger network fetch on first visit or re-fetch
+		if p.networks == nil {
+			p.networkLoading = true
+			p.loading = true
+			return tea.Batch(
+				fetchNetworks(p.dockerClient),
+				spinnerTick(),
+			)
+		}
+		// Already have data, just rebuild rows
+		p.loading = false
+		p.rebuildTableRows()
+		p.recalcTable()
+		return nil
+
+	default:
+		// Swap back to container columns and actions
+		p.table = p.table.WithColumns(containerColumns())
+		p.actions = containerActions
+		p.loading = (p.groups == nil)
+		p.rebuildTableRows()
+		p.recalcTable()
+		return nil
+	}
 }
 
 // SelectedContainer returns the full Docker name of the currently
@@ -686,51 +825,6 @@ func (p Pane) GetSelectedImage() *docker.Image {
 	return &p.images[sel]
 }
 
-// switchTab changes the active tab, updates actions, and fetches data.
-func (p *Pane) switchTab(idx int) tea.Cmd {
-	if idx == p.activeTab {
-		return nil
-	}
-	p.activeTab = idx
-	p.searchMatches = nil
-	p.searchMatchIdx = 0
-
-	// Update actions for this tab
-	switch idx {
-	case 0:
-		p.actions = p.allActions["containers"]
-		p.table = NewTable(containerColumns()).
-			WithBaseStyle(lipgloss.NewStyle().Foreground(p.theme.Foreground).Background(p.theme.Background)).
-			WithHeaderStyle(lipgloss.NewStyle().Foreground(p.theme.TableHeader).Background(p.theme.TabBarBackground).Bold(true)).
-			WithSelectedStyle(lipgloss.NewStyle().Background(p.theme.RowSelected).Bold(true)).
-			WithDividerStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
-			WithSepStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
-			WithHighlightColumn(1, lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)).
-			Focused(p.focused)
-		p.loading = true
-		p.recalcTable()
-		return tea.Batch(fetchContainers(p.dockerClient), spinnerTick())
-	case 1:
-		p.actions = p.allActions["images"]
-		p.table = NewTable(imageColumns()).
-			WithBaseStyle(lipgloss.NewStyle().Foreground(p.theme.Foreground).Background(p.theme.Background)).
-			WithHeaderStyle(lipgloss.NewStyle().Foreground(p.theme.TableHeader).Background(p.theme.TabBarBackground).Bold(true)).
-			WithSelectedStyle(lipgloss.NewStyle().Background(p.theme.RowSelected).Bold(true)).
-			WithDividerStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
-			WithSepStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
-			Focused(p.focused)
-		p.loading = true
-		p.recalcTable()
-		return tea.Batch(fetchImages(p.dockerClient), spinnerTick())
-	default:
-		p.actions = p.allActions["volumes"]
-		p.loading = false
-		p.table = NewTable(containerColumns()).Focused(p.focused)
-		p.recalcTable()
-		return nil
-	}
-}
-
 // rebuildImageRows rebuilds the table rows from image data.
 func (p *Pane) rebuildImageRows() {
 	rows := buildImageRows(p.theme, p.images)
@@ -738,6 +832,75 @@ func (p *Pane) rebuildImageRows() {
 	if len(rows) > 0 && p.table.HighlightedRow() < 0 {
 		p.table.SelectFirst()
 	}
+}
+
+// ActiveTab returns the index of the currently active tab.
+func (p Pane) ActiveTab() int {
+	return p.activeTab
+}
+
+// ActiveTabKey returns the key of the currently active tab.
+func (p Pane) ActiveTabKey() rune {
+	if p.activeTab >= 0 && p.activeTab < len(p.tabs) {
+		return p.tabs[p.activeTab].Key
+	}
+	return 0
+}
+
+// ── Network selection ────────────────────────────────────────────
+
+// SelectedNetwork returns the full Docker name of the currently
+// highlighted network, or empty string if the networks tab is not
+// active or a group header is selected.
+func (p Pane) SelectedNetwork() string {
+	if p.ActiveTabKey() != 'N' {
+		return ""
+	}
+	sel := p.table.HighlightedRow()
+	if p.table.RowTypeAt(sel) != RowData {
+		return ""
+	}
+	name, _ := p.table.GetCell(sel, colOriginalName)
+	return name
+}
+
+// GetSelectedNetwork returns the full Network object for the
+// currently highlighted row, or nil if not available.
+func (p Pane) GetSelectedNetwork() *docker.Network {
+	name := p.SelectedNetwork()
+	if name == "" {
+		return nil
+	}
+	for _, g := range p.networks {
+		for i := range g.Networks {
+			if g.Networks[i].Name == name {
+				return &g.Networks[i]
+			}
+		}
+	}
+	return nil
+}
+
+// doNetworkAction returns a tea.Cmd that executes a network-level
+// action. Returns nil if the action is not applicable.
+func (p Pane) doNetworkAction(action string) tea.Cmd {
+	switch action {
+	case "prune":
+		return func() tea.Msg {
+			_, err := p.dockerClient.PruneNetworks()
+			return networkActionExecutedMsg{action: "prune", err: err}
+		}
+	case "inspect":
+		name := p.SelectedNetwork()
+		if name == "" {
+			return nil
+		}
+		return func() tea.Msg {
+			raw, err := p.dockerClient.InspectNetworkRaw(name)
+			return networkInspectLoadedMsg{name: name, json: raw, err: err}
+		}
+	}
+	return nil
 }
 
 // doAction returns a tea.Cmd that executes the given action function
@@ -921,6 +1084,18 @@ func buildImageRows(theme Theme, images []docker.Image) []Row {
 	return rows
 }
 
+// networkColumns returns the column definitions for the network
+// table.  All columns have fixed widths.
+func networkColumns() []ColumnDef {
+	return []ColumnDef{
+		{Key: colName, Title: "NAME", Width: 20},
+		{Key: colDriver, Title: "DRIVER", Width: 12},
+		{Key: colScope, Title: "SCOPE", Width: 8},
+		{Key: colSubnet, Title: "SUBNET", Width: 18},
+		{Key: colGateway, Title: "GATEWAY", Width: 15},
+		{Key: colContainers, Title: "CNT", Width: 5},
+	}
+}
 // buildTableRows converts Docker container groups into table Rows
 // with status dots, Docker-style coloring, collapsible groups, and
 // visual separators between groups.
@@ -1047,10 +1222,87 @@ func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[s
 	return rows
 }
 
+// buildNetworkRows converts Docker network groups into table Rows
+// with collapsible driver-group headers.
+func buildNetworkRows(theme Theme, groups []docker.NetworkGroup, collapsed map[string]bool) []Row {
+	groupStyle := lipgloss.NewStyle().
+		Foreground(theme.TabActive).
+		Background(theme.TabBarBackground).
+		Bold(true)
+
+	bodyStyle := lipgloss.NewStyle().Foreground(theme.Foreground)
+	dimStyle := lipgloss.NewStyle().Foreground(theme.TabInactive)
+
+	var rows []Row
+	for _, g := range groups {
+		driver := g.Driver
+		if driver == "" {
+			driver = "unknown"
+		}
+		groupID := "netgroup:" + driver
+
+		count := len(g.Networks)
+		toggle := "▸"
+		if collapsed[groupID] {
+			toggle = "▻"
+		}
+		title := fmt.Sprintf("%s %s (%d)", toggle, driver, count)
+
+		headerRow := Row{
+			Cells: map[string]Cell{
+				colName:       {Value: title},
+				colDriver:     {Value: ""},
+				colScope:      {Value: ""},
+				colSubnet:     {Value: ""},
+				colGateway:    {Value: ""},
+				colContainers: {Value: ""},
+			},
+			Style:   groupStyle,
+			Type:    RowGroup,
+			GroupID: groupID,
+		}
+		rows = append(rows, headerRow)
+
+		if collapsed[groupID] {
+			continue
+		}
+
+		for _, n := range g.Networks {
+			containerCount := fmt.Sprintf("%d", len(n.Containers))
+			containerCell := Cell{Value: containerCount, Style: dimStyle}
+			if len(n.Containers) > 0 {
+				containerCell.Style = bodyStyle
+			}
+
+			row := Row{
+				Cells: map[string]Cell{
+					colName:         {Value: n.Name, Style: bodyStyle},
+					colOriginalName: {Value: n.Name},
+					colDriver:       {Value: n.Driver, Style: dimStyle},
+					colScope:        {Value: n.Scope, Style: dimStyle},
+					colSubnet:       {Value: n.Subnet, Style: bodyStyle},
+					colGateway:      {Value: n.Gateway, Style: bodyStyle},
+					colContainers:   containerCell,
+				},
+				Type:    RowData,
+				GroupID: groupID,
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
 // rebuildTableRows rebuilds rows from groups, filtering collapsed
 // groups, and updates the table while preserving selection.
+// The exact row set depends on the active tab.
 func (p *Pane) rebuildTableRows() {
-	rows := buildTableRows(p.theme, p.groups, p.collapsedGroups)
+	var rows []Row
+	if p.ActiveTabKey() == 'N' {
+		rows = buildNetworkRows(p.theme, p.networks, p.networkCollapsed)
+	} else {
+		rows = buildTableRows(p.theme, p.groups, p.collapsedGroups)
+	}
 	p.table = p.table.WithRows(rows)
 	if len(rows) > 0 && p.table.HighlightedRow() < 0 {
 		p.table.SelectFirst()
@@ -1281,6 +1533,15 @@ func fetchImages(dc *docker.Client) tea.Cmd {
 	return func() tea.Msg {
 		images, err := dc.ListImages()
 		return imagesLoadedMsg{images: images, err: err}
+	}
+}
+
+// fetchNetworks returns a command that asynchronously fetches
+// Docker networks and groups them by driver.
+func fetchNetworks(dc *docker.Client) tea.Cmd {
+	return func() tea.Msg {
+		groups, err := dc.ListNetworks()
+		return networksLoadedMsg{groups: groups, err: err}
 	}
 }
 

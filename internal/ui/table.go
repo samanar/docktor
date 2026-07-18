@@ -112,6 +112,17 @@ func (t Table) WithRows(rows []Row) Table {
 	return t
 }
 
+// WithColumns replaces the column definitions and resets the
+// resolved widths so they are recomputed on next render.
+func (t Table) WithColumns(cols []ColumnDef) Table {
+	t.cols = cols
+	t.resolved = nil
+	// Reset selection on column change since data will also change
+	t.selected = -1
+	t.yOffset = 0
+	return t
+}
+
 // WithBaseStyle sets the default cell style.
 func (t Table) WithBaseStyle(s lipgloss.Style) Table {
 	t.baseStyle = s
