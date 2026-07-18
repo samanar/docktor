@@ -58,6 +58,12 @@ type actionExecutedMsg struct {
 	err    error
 }
 
+// imagesLoadedMsg is sent when docker image list has been fetched.
+type imagesLoadedMsg struct {
+	images []docker.Image
+	err    error
+}
+
 // ── Tab ──────────────────────────────────────────────────────────
 
 // Tab represents a single tab in the pane's tab bar.
@@ -94,7 +100,8 @@ type Pane struct {
 	activeTab int
 
 	// Actions
-	actions []Action
+	actions    []Action
+	allActions map[string][]Action // per-tab action sets
 
 	// Focus
 	focused bool
@@ -109,6 +116,9 @@ type Pane struct {
 
 	// ── Raw grouped container data ───────────────────
 	groups []docker.ContainerGroup
+
+	// ── Image data ───────────────────────────────────
+	images []docker.Image
 
 	// ── Collapsible groups ───────────────────────────
 	collapsedGroups map[string]bool
@@ -133,13 +143,25 @@ func NewPane(theme Theme, dc *docker.Client) Pane {
 		{Key: 'N', Label: "Networks"},
 	}
 
-	actions := []Action{
+	containerActions := []Action{
 		{Key: 's', Label: "Start"},
 		{Key: 'x', Label: "Stop"},
 		{Key: 'r', Label: "Restart"},
 		{Key: 'K', Label: "Kill"},
 		{Key: '/', Label: "Filter"},
 		{Key: 'q', Label: "Quit"},
+	}
+
+	imageActions := []Action{
+		{Key: '/', Label: "Filter"},
+		{Key: 'q', Label: "Quit"},
+	}
+
+	allActions := map[string][]Action{
+		"containers": containerActions,
+		"images":     imageActions,
+		"volumes":    {{Key: '/', Label: "Filter"}, {Key: 'q', Label: "Quit"}},
+		"networks":   {{Key: '/', Label: "Filter"}, {Key: 'q', Label: "Quit"}},
 	}
 
 	tbl := NewTable(containerColumns()).
@@ -177,7 +199,8 @@ func NewPane(theme Theme, dc *docker.Client) Pane {
 	return Pane{
 		theme:           theme,
 		tabs:            tabs,
-		actions:         actions,
+		actions:         containerActions,
+		allActions:      allActions,
 		activeTab:       0,
 		focused:         true,
 		table:           tbl,
@@ -203,7 +226,7 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 	// ── Container data arrived ────────────────────────
 	case containersLoadedMsg:
 		p.loading = false
-		if msg.err == nil {
+		if msg.err == nil && p.activeTab == 0 {
 			p.groups = msg.groups
 			p.rebuildTableRows()
 			p.recalcTable()
@@ -211,20 +234,34 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		}
 		return p, nil
 
+	// ── Image data arrived ────────────────────────────
+	case imagesLoadedMsg:
+		p.loading = false
+		if msg.err == nil && p.activeTab == 1 {
+			p.images = msg.images
+			p.rebuildImageRows()
+			p.recalcTable()
+		}
+		return p, nil
+
 	// ── Stats refresh cycle ───────────────────────────
 	case statsTickMsg:
-		return p, fetchStats(p.dockerClient)
+		if p.activeTab == 0 {
+			return p, fetchStats(p.dockerClient)
+		}
+		return p, nil
 
 	case statsRefreshMsg:
-		if msg.err == nil {
+		if msg.err == nil && p.activeTab == 0 {
 			docker.MergeStats(p.groups, msg.stats)
 			sel := p.table.HighlightedRow()
 			gid := p.table.GroupIDAt(sel)
 			p.rebuildTableRows()
 			// Try to restore previous selection
 			p.restoreSelection(sel, gid)
+			return p, statsTick()
 		}
-		return p, statsTick()
+		return p, nil
 
 	// ── Spinner animation ─────────────────────────────
 	case spinnerTickMsg:
@@ -332,27 +369,37 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 			// Tab switching
 			case "c":
-				p.activeTab = p.tabIndexByKey('c')
+				return p, p.switchTab(0)
 			case "i":
-				p.activeTab = p.tabIndexByKey('i')
+				return p, p.switchTab(1)
 			case "v":
-				p.activeTab = p.tabIndexByKey('v')
+				return p, p.switchTab(2)
 			case "N":
-				p.activeTab = p.tabIndexByKey('N')
+				return p, p.switchTab(3)
 
-			// Toggle group collapse
+			// Toggle group collapse (containers only)
 			case " ":
-				p.toggleGroup()
+				if p.activeTab == 0 {
+					p.toggleGroup()
+				}
 
 			// ── Actions ─────────────────────────────
 			case "s":
-				return p, p.doAction("start", p.dockerClient.StartContainer)
+				if p.activeTab == 0 {
+					return p, p.doAction("start", p.dockerClient.StartContainer)
+				}
 			case "x":
-				return p, p.doAction("stop", p.dockerClient.StopContainer)
+				if p.activeTab == 0 {
+					return p, p.doAction("stop", p.dockerClient.StopContainer)
+				}
 			case "r":
-				return p, p.doAction("restart", p.dockerClient.RestartContainer)
+				if p.activeTab == 0 {
+					return p, p.doAction("restart", p.dockerClient.RestartContainer)
+				}
 			case "K":
-				return p, p.doAction("kill", p.dockerClient.KillContainer)
+				if p.activeTab == 0 {
+					return p, p.doAction("kill", p.dockerClient.KillContainer)
+				}
 
 			// Quit — delegated to AppModel
 			case "q":
@@ -609,6 +656,90 @@ func (p Pane) GetSelectedContainer() *docker.Container {
 	return nil
 }
 
+// SelectedImage returns the repo:tag of the currently highlighted
+// image, or empty string if none is selected or on a different tab.
+func (p Pane) SelectedImage() string {
+	if p.activeTab != 1 {
+		return ""
+	}
+	sel := p.table.HighlightedRow()
+	if sel < 0 || sel >= len(p.images) {
+		return ""
+	}
+	img := p.images[sel]
+	if img.Repo == "<none>" {
+		return img.ID
+	}
+	return img.Repo + ":" + img.Tag
+}
+
+// GetSelectedImage returns the full Image object for the currently
+// highlighted row, or nil if not on the images tab.
+func (p Pane) GetSelectedImage() *docker.Image {
+	if p.activeTab != 1 {
+		return nil
+	}
+	sel := p.table.HighlightedRow()
+	if sel < 0 || sel >= len(p.images) {
+		return nil
+	}
+	return &p.images[sel]
+}
+
+// switchTab changes the active tab, updates actions, and fetches data.
+func (p *Pane) switchTab(idx int) tea.Cmd {
+	if idx == p.activeTab {
+		return nil
+	}
+	p.activeTab = idx
+	p.searchMatches = nil
+	p.searchMatchIdx = 0
+
+	// Update actions for this tab
+	switch idx {
+	case 0:
+		p.actions = p.allActions["containers"]
+		p.table = NewTable(containerColumns()).
+			WithBaseStyle(lipgloss.NewStyle().Foreground(p.theme.Foreground).Background(p.theme.Background)).
+			WithHeaderStyle(lipgloss.NewStyle().Foreground(p.theme.TableHeader).Background(p.theme.TabBarBackground).Bold(true)).
+			WithSelectedStyle(lipgloss.NewStyle().Background(p.theme.RowSelected).Bold(true)).
+			WithDividerStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
+			WithSepStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
+			WithHighlightColumn(1, lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)).
+			Focused(p.focused)
+		p.loading = true
+		p.recalcTable()
+		return tea.Batch(fetchContainers(p.dockerClient), spinnerTick())
+	case 1:
+		p.actions = p.allActions["images"]
+		p.table = NewTable(imageColumns()).
+			WithBaseStyle(lipgloss.NewStyle().Foreground(p.theme.Foreground).Background(p.theme.Background)).
+			WithHeaderStyle(lipgloss.NewStyle().Foreground(p.theme.TableHeader).Background(p.theme.TabBarBackground).Bold(true)).
+			WithSelectedStyle(lipgloss.NewStyle().Background(p.theme.RowSelected).Bold(true)).
+			WithDividerStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
+			WithSepStyle(lipgloss.NewStyle().Foreground(p.theme.DividerLine)).
+			Focused(p.focused)
+		p.loading = true
+		p.recalcTable()
+		return tea.Batch(fetchImages(p.dockerClient), spinnerTick())
+	default:
+		p.actions = p.allActions["volumes"]
+		p.loading = false
+		p.table = NewTable(containerColumns()).Focused(p.focused)
+		p.recalcTable()
+		return nil
+	}
+}
+
+// rebuildImageRows rebuilds the table rows from image data.
+func (p *Pane) rebuildImageRows() {
+	rows := buildImageRows(p.theme, p.images)
+	p.table = p.table.WithRows(rows)
+	if len(rows) > 0 && p.table.HighlightedRow() < 0 {
+		p.table.SelectFirst()
+	}
+}
+
 // doAction returns a tea.Cmd that executes the given action function
 // on the currently selected container.  Returns nil if no container
 // is selected.
@@ -749,6 +880,45 @@ func containerColumns() []ColumnDef {
 		{Key: colCPUMem, Title: "CPU/MEM", Width: 18},
 		{Key: colPorts, Title: "PORTS", Width: 0}, // flex
 	}
+}
+
+// imageColumns returns column definitions for the image table.
+func imageColumns() []ColumnDef {
+	return []ColumnDef{
+		{Key: colName, Title: "REPOSITORY", Width: 25},
+		{Key: "tag", Title: "TAG", Width: 15},
+		{Key: colIcon, Title: "ID", Width: 14},
+		{Key: "size", Title: "SIZE", Width: 10},
+		{Key: "created", Title: "CREATED", Width: 0}, // flex
+	}
+}
+
+// buildImageRows converts Docker images into table rows.
+func buildImageRows(theme Theme, images []docker.Image) []Row {
+	bodyStyle := lipgloss.NewStyle().Foreground(theme.Foreground)
+	dimStyle := lipgloss.NewStyle().Foreground(theme.TabInactive)
+	idStyle := lipgloss.NewStyle().Foreground(theme.TabHighlight)
+
+	var rows []Row
+	for _, img := range images {
+		shortID := img.ID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+
+		row := Row{
+			Cells: map[string]Cell{
+				colName:  {Value: img.Repo, Style: bodyStyle},
+				"tag":    {Value: img.Tag, Style: bodyStyle},
+				colIcon:  {Value: shortID, Style: idStyle},
+				"size":   {Value: img.Size, Style: dimStyle},
+				"created": {Value: img.Created, Style: dimStyle},
+			},
+			Type: RowData,
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 // buildTableRows converts Docker container groups into table Rows
@@ -1102,6 +1272,15 @@ func fetchContainers(dc *docker.Client) tea.Cmd {
 			mergeStarted(groups, started)
 		}
 		return containersLoadedMsg{groups: groups, err: err}
+	}
+}
+
+// fetchImages returns a command that asynchronously fetches Docker
+// images.
+func fetchImages(dc *docker.Client) tea.Cmd {
+	return func() tea.Msg {
+		images, err := dc.ListImages()
+		return imagesLoadedMsg{images: images, err: err}
 	}
 }
 
