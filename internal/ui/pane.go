@@ -556,7 +556,8 @@ func (p Pane) View() string {
 	if p.searchMode {
 		searchBarH = 1
 	}
-	contentH := innerH - 4 - searchBarH
+	// tabBar(1) + content(header+data) + divider(1) + actionBar(1) = 3 fixed lines
+	contentH := innerH - 3 - searchBarH
 	if contentH < 1 {
 		contentH = 1
 	}
@@ -719,18 +720,20 @@ func (p *Pane) toggleGroup() {
 }
 
 func (p *Pane) recalcTable() {
-	// Content area: total height - borders(2) - tabBar(1) -
-	//   dividers(2) - actionBar(1) - searchBar(1 if active)
+	// Fixed chrome: borders(2) + tabBar(1) + divider(1) + actionBar(1)
+	// The bottom divider is part of the content area (table header separator
+	// doubles as the divider), so we save 1 line.
 	searchH := 0
 	if p.searchMode {
 		searchH = 1
 	}
-	contentH := p.height - 2 - 1 - 2 - 1 - searchH
+	contentH := p.height - 2 - 1 - 1 - 1 - searchH
 	if contentH < 1 {
 		contentH = 1
 	}
-	// Reserve 2 lines for header + divider
-	dataH := contentH - 2
+	// Table renders: header(1) + dataH rows = contentH
+	// (the table's own divider line shares space with the UI divider)
+	dataH := contentH - 1
 	if dataH < 1 {
 		dataH = 1
 	}
@@ -1534,21 +1537,16 @@ func (p *Pane) switchToTab(tabIdx int) {
 }
 
 // restoreSelection attempts to restore the previously selected row
-// after a table rebuild.  Falls back to SelectFirst if the previous
-// row no longer exists or its GroupID changed.
+// after a table rebuild.  WithRows already preserves selected and
+// yOffset for unchanged rows; we only intervene if the selection
+// was clamped out of range or the group changed.
 func (p *Pane) restoreSelection(prevIdx int, prevGID string) {
-	if prevIdx < 0 || prevIdx >= p.table.RowCount() {
-		p.table.SelectFirst()
+	// If selection is still valid (WithRows preserved it), keep scroll position
+	if prevIdx >= 0 && prevIdx < p.table.RowCount() &&
+		p.table.GroupIDAt(prevIdx) == prevGID && prevGID != "" {
 		return
 	}
-	// If the same group ID is at the same index, keep it
-	if p.table.GroupIDAt(prevIdx) == prevGID && prevGID != "" {
-		p.table.SelectFirst()
-		for i := 0; i < prevIdx; i++ {
-			p.table.MoveSelection(1)
-		}
-		return
-	}
+	// Selection was lost — fall back to the first row
 	p.table.SelectFirst()
 }
 
