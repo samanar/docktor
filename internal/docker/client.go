@@ -13,18 +13,18 @@ import (
 
 // Volume represents a single Docker volume.
 type Volume struct {
-	Name      string
-	Driver    string
+	Name       string
+	Driver     string
 	Mountpoint string
-	Size      string // human-readable size, e.g. "824.6kB"
-	SizeBytes int64  // size in bytes for sorting
-	CreatedAt string
+	Size       string // human-readable size, e.g. "824.6kB"
+	SizeBytes  int64  // size in bytes for sorting
+	CreatedAt  string
 }
 
 // VolumeFileUsage represents file/folder disk usage inside a volume.
 type VolumeFileUsage struct {
-	Name string // file or folder name
-	Size string // human-readable size, e.g. "12MB"
+	Name  string // file or folder name
+	Size  string // human-readable size, e.g. "12MB"
 	IsDir bool
 }
 
@@ -817,15 +817,34 @@ func sortFileUsage(entries []VolumeFileUsage) {
 // ── Helpers ────────────────────────────────────────────────────────
 
 func runDockerCLI(args ...string) (string, error) {
+	// Check if docker binary exists before attempting execution
+	if _, lookupErr := exec.LookPath("docker"); lookupErr != nil {
+		return "", fmt.Errorf("docker is not installed or not in PATH: %w", lookupErr)
+	}
+
 	cmd := exec.Command("docker", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("%s: %s", err, string(exitErr.Stderr))
+			stderr := string(exitErr.Stderr)
+			// Detect common daemon-unavailable patterns
+			if strings.Contains(stderr, "Cannot connect to the Docker daemon") ||
+				strings.Contains(stderr, "Is the docker daemon running") ||
+				strings.Contains(stderr, "docker daemon is not running") {
+				return "", fmt.Errorf("docker daemon is not running — start it with 'systemctl start docker' or 'dockerd'")
+			}
+			return "", fmt.Errorf("%s", strings.TrimSpace(stderr))
 		}
-		return "", err
+		return "", fmt.Errorf("failed to run docker: %w", err)
 	}
 	return string(out), nil
+}
+
+// IsDockerAvailable returns nil if Docker CLI and daemon are
+// reachable, or an error describing the problem.
+func IsDockerAvailable() error {
+	_, err := runDockerCLI("info", "--format", "{{.ServerVersion}}")
+	return err
 }
 
 // extractComposeProject parses Docker container labels (comma-

@@ -122,10 +122,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Logs arrived ─────────────────────────────────
 	case logsLoadedMsg:
-		if msg.containerName == m.selectedName && msg.err == nil {
-			m.logLines = strings.Split(msg.logs, "\n")
-			if m.logAutoScroll {
-				m.scrollLogsToEnd()
+		if msg.containerName == m.selectedName {
+			if msg.err != nil {
+				m.logLines = []string{"Error fetching logs: " + msg.err.Error()}
+				m.logAutoScroll = false
+			} else {
+				m.logLines = strings.Split(msg.logs, "\n")
+				if m.logAutoScroll {
+					m.scrollLogsToEnd()
+				}
 			}
 		}
 		return m, nil
@@ -151,28 +156,46 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Container action completed ───────────────────
 	case actionExecutedMsg:
 		// Refresh container data after start/stop/restart/kill
+		if msg.err != nil {
+			// Show error briefly in the pane
+			m.pane.lastError = fmt.Sprintf("Failed to %s %s: %v", msg.action, msg.name, msg.err)
+		}
 		return m, m.pane.Init()
 
 	// ── Image layers arrived ─────────────────────────
 	case imageLayersLoadedMsg:
-		if msg.imageID == m.selectedImageID && msg.err == nil {
-			m.imageLayers = msg.layers
+		if msg.imageID == m.selectedImageID {
+			if msg.err != nil {
+				m.imageLayers = []docker.ImageLayer{
+					{Command: "Error: " + msg.err.Error(), Size: ""},
+				}
+			} else {
+				m.imageLayers = msg.layers
+			}
 			m.logLines = nil // clear container logs
 		}
 		return m, nil
 
 	// ── Network inspect arrived ──────────────────────
 	case networkInspectLoadedMsg:
-		if msg.name == m.selectedNetworkName && msg.err == nil {
-			m.buildNetworkDetail(msg.name, msg.json)
-			if m.networkDetailAutoScroll {
-				m.scrollNetworkDetailToEnd()
+		if msg.name == m.selectedNetworkName {
+			if msg.err != nil {
+				m.networkDetailLines = []string{"Error inspecting network: " + msg.err.Error()}
+				m.networkDetailAutoScroll = false
+			} else {
+				m.buildNetworkDetail(msg.name, msg.json)
+				if m.networkDetailAutoScroll {
+					m.scrollNetworkDetailToEnd()
+				}
 			}
 		}
 		return m, nil
 
 	// ── Network action completed ─────────────────────
 	case networkActionExecutedMsg:
+		if msg.err != nil {
+			m.pane.lastError = fmt.Sprintf("Network %s failed: %v", msg.action, msg.err)
+		}
 		// Refresh pane after network prune
 		return m, m.pane.Init()
 

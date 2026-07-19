@@ -177,6 +177,9 @@ type Pane struct {
 	networks         []docker.NetworkGroup
 	networkLoading   bool
 	networkCollapsed map[string]bool
+
+	// ── Error state ─────────────────────────────────
+	lastError string // non-empty when Docker is unreachable or an operation failed
 }
 
 // ── Action sets per tab ──────────────────────────────────────────
@@ -296,7 +299,12 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 	// ── Container data arrived ────────────────────────
 	case containersLoadedMsg:
 		p.loading = false
-		if msg.err == nil && p.activeTab == 0 {
+		if msg.err != nil {
+			p.lastError = "Docker error: " + msg.err.Error()
+			return p, nil
+		}
+		p.lastError = ""
+		if p.activeTab == 0 {
 			p.groups = msg.groups
 			p.rebuildTableRows()
 			p.recalcTable()
@@ -311,11 +319,14 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 	case networksLoadedMsg:
 		p.networkLoading = false
 		p.loading = false
-		if msg.err == nil {
-			p.networks = msg.groups
-			p.rebuildTableRows()
-			p.recalcTable()
+		if msg.err != nil {
+			p.lastError = "Docker error: " + msg.err.Error()
+			return p, nil
 		}
+		p.lastError = ""
+		p.networks = msg.groups
+		p.rebuildTableRows()
+		p.recalcTable()
 		return p, nil
 
 	// ── Network action completed ─────────────────────
@@ -334,7 +345,12 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 	// ── Image data arrived ────────────────────────────
 	case imagesLoadedMsg:
 		p.loading = false
-		if msg.err == nil && p.activeTab == 1 {
+		if msg.err != nil {
+			p.lastError = "Docker error: " + msg.err.Error()
+			return p, nil
+		}
+		p.lastError = ""
+		if p.activeTab == 1 {
 			p.images = msg.images
 			p.rebuildImageRows()
 			p.recalcTable()
@@ -344,11 +360,14 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 	// ── Volume data arrived ───────────────────────────
 	case volumesLoadedMsg:
 		p.volumesLoading = false
-		if msg.err == nil {
-			p.volumes = msg.volumes
-			p.buildAndSetVolumeRows()
-			p.recalcTable()
+		if msg.err != nil {
+			p.lastError = "Docker error: " + msg.err.Error()
+			return p, nil
 		}
+		p.lastError = ""
+		p.volumes = msg.volumes
+		p.buildAndSetVolumeRows()
+		p.recalcTable()
 		return p, nil
 
 	// ── Stats refresh cycle ───────────────────────────
@@ -362,18 +381,21 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		if p.ActiveTabKey() != 'c' {
 			return p, nil
 		}
-		if msg.err == nil {
-			docker.MergeStats(p.groups, msg.stats)
-			sel := p.table.HighlightedRow()
-			gid := p.table.GroupIDAt(sel)
-			p.rebuildTableRows()
-			// Try to restore previous selection
-			p.restoreSelection(sel, gid)
-			// Ensure the selected row is visible after rebuild
-			p.table.EnsureVisible()
+		if msg.err != nil {
+			p.lastError = "Stats error: " + msg.err.Error()
+			// Keep trying — daemon may come back
 			return p, statsTick()
 		}
-		return p, nil
+		p.lastError = ""
+		docker.MergeStats(p.groups, msg.stats)
+		sel := p.table.HighlightedRow()
+		gid := p.table.GroupIDAt(sel)
+		p.rebuildTableRows()
+		// Try to restore previous selection
+		p.restoreSelection(sel, gid)
+		// Ensure the selected row is visible after rebuild
+		p.table.EnsureVisible()
+		return p, statsTick()
 
 	// ── Spinner animation ─────────────────────────────
 	case spinnerTickMsg:
@@ -563,7 +585,9 @@ func (p Pane) View() string {
 		contentH = 1
 	}
 	var contentArea string
-	if p.loading {
+	if p.lastError != "" {
+		contentArea = p.renderError(innerW, contentH, p.lastError)
+	} else if p.loading {
 		contentArea = p.renderLoading(innerW, contentH, "Loading containers...")
 	} else if p.volumesLoading {
 		contentArea = p.renderLoading(innerW, contentH, "Loading volumes...")
@@ -812,6 +836,38 @@ func (p *Pane) switchTab(key rune) tea.Cmd {
 		p.rebuildTableRows()
 		p.recalcTable()
 		return nil
+	}
+}
+
+// retryTab clears the error state and re-fetches data for the
+// currently active tab.  Called when the user presses 'r' while
+// an error is displayed.
+func (p *Pane) retryTab() tea.Cmd {
+	p.lastError = ""
+	p.loading = true
+	switch p.ActiveTabKey() {
+	case 'N':
+		p.networkLoading = true
+		return tea.Batch(
+			fetchNetworks(p.dockerClient),
+			spinnerTick(),
+		)
+	case 'i':
+		return tea.Batch(
+			fetchImages(p.dockerClient),
+			spinnerTick(),
+		)
+	case 'v':
+		p.volumesLoading = true
+		return tea.Batch(
+			fetchVolumes(p.dockerClient),
+			spinnerTick(),
+		)
+	default: // containers
+		return tea.Batch(
+			fetchContainers(p.dockerClient),
+			spinnerTick(),
+		)
 	}
 }
 
@@ -1708,6 +1764,26 @@ func (p Pane) renderLoading(width, height int, msg string) string {
 		Background(p.theme.Background).
 		Align(lipgloss.Center, lipgloss.Center).
 		Render(text)
+}
+
+// renderError draws an error message with a retry hint.
+func (p Pane) renderError(width, height int, msg string) string {
+	errorStyle := lipgloss.NewStyle().
+		Foreground(p.theme.StatusStopped).
+		Bold(true)
+
+	hintStyle := lipgloss.NewStyle().
+		Foreground(p.theme.TabHighlight)
+
+	errorText := errorStyle.Render("✖  " + msg)
+	hintText := hintStyle.Render("\n\nPress r to retry")
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Height(height).
+		Background(p.theme.Background).
+		Align(lipgloss.Center, lipgloss.Center).
+		Render(errorText + hintText)
 }
 
 // renderEmpty draws a centred message when no data was found.
