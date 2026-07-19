@@ -109,6 +109,18 @@ func (t Table) WithRows(rows []Row) Table {
 	if t.selected < -1 {
 		t.selected = -1
 	}
+	// Ensure selected row is visible after updating rows
+	// (inline the scroll logic since scrollToVisible has a pointer receiver)
+	if t.selected >= 0 && t.height >= 1 {
+		if t.selected < t.yOffset {
+			t.yOffset = t.selected
+		} else if t.selected >= t.yOffset+t.height {
+			t.yOffset = t.selected - t.height + 1
+		}
+		if t.yOffset < 0 {
+			t.yOffset = 0
+		}
+	}
 	return t
 }
 
@@ -262,6 +274,13 @@ func (t *Table) SelectFirst() {
 		t.selected = 0
 		t.yOffset = 0
 	}
+}
+
+// EnsureVisible scrolls to make the selected row visible.
+// Call this explicitly when you need to guarantee the scroll position
+// is correct (e.g., after data updates).
+func (t *Table) EnsureVisible() {
+	t.scrollToVisible()
 }
 
 // HighlightedRow returns the index of the selected row, or -1.

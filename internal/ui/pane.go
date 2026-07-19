@@ -369,6 +369,8 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 			p.rebuildTableRows()
 			// Try to restore previous selection
 			p.restoreSelection(sel, gid)
+			// Ensure the selected row is visible after rebuild
+			p.table.EnsureVisible()
 			return p, statsTick()
 		}
 		return p, nil
@@ -382,8 +384,7 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		return p, nil
 
 	case tea.WindowSizeMsg:
-		p.width = int(float64(msg.Width) * 0.70)
-		p.height = msg.Height
+		// Dimensions are set by AppModel before passing the message.
 		p.recalcTable()
 
 	case tea.KeyMsg:

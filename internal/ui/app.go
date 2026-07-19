@@ -108,6 +108,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.ready = true
+		// Set pane dimensions so it can compute correct table height.
+		// Pane takes 70% width and shares top 1/3 of height with overview.
+		m.pane.width = int(float64(msg.Width) * 0.70)
+		paneH := msg.Height / 3
+		if paneH < 5 {
+			paneH = 5
+		}
+		m.pane.height = paneH
 		var cmd tea.Cmd
 		m.pane, cmd = m.pane.Update(msg)
 		return m, cmd
