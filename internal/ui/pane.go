@@ -564,6 +564,10 @@ func (p Pane) View() string {
 	// always matches the current pane size.
 	p.recalcTable()
 
+	// Sync table focus state with pane focus — the table highlight
+	// should dim when the pane is not focused (e.g., user pressed 2 or 3).
+	p.table = p.table.Focused(p.focused)
+
 	innerW := p.width - 2  // minus left/right borders
 	innerH := p.height - 2 // minus top/bottom borders
 
@@ -1274,6 +1278,12 @@ func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[s
 		}
 		groupID := "group:" + label
 
+		// Track short names used within this group to detect duplicates.
+		// Maps short name → index of first row with that name (or -1 if
+		// already renamed).
+		firstNameIdx := make(map[string]int, len(g.Containers))
+		nameCount := make(map[string]int, len(g.Containers))
+
 		// ── Project header ─────────────────────────────
 		count := len(g.Containers)
 		toggle := "▸"
@@ -1333,6 +1343,25 @@ func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[s
 			}
 
 			shortName := shortenName(c.Name)
+
+			// Detect duplicate short names within the same group
+			// and disambiguate (e.g. two "app" containers become
+			// "app (1)" and "app (2)").
+			if idx, exists := firstNameIdx[shortName]; exists {
+				nameCount[shortName]++
+				// Rename the first occurrence on first collision
+				if idx >= 0 {
+					rows[idx].Cells[colName] = Cell{
+						Value: shortName + " (1)",
+						Style: rows[idx].Cells[colName].Style,
+					}
+					firstNameIdx[shortName] = -1 // mark as renamed
+				}
+				shortName = fmt.Sprintf("%s (%d)", shortName, nameCount[shortName])
+			} else {
+				firstNameIdx[shortName] = len(rows) // index of this row
+				nameCount[shortName] = 1
+			}
 
 			// Combined CPU / Memory (compact for table column)
 			memUsed := memUsedPortion(c.Memory)
