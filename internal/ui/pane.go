@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -189,6 +190,7 @@ var containerActions = []Action{
 	{Key: 'x', Label: "Stop"},
 	{Key: 'r', Label: "Restart"},
 	{Key: 'K', Label: "Kill"},
+	{Key: 'e', Label: "Exec"},
 	{Key: '/', Label: "Filter"},
 	{Key: 'q', Label: "Quit"},
 }
@@ -220,6 +222,7 @@ func NewPane(theme Theme, dc *docker.Client) Pane {
 		{Key: 'x', Label: "Stop"},
 		{Key: 'r', Label: "Restart"},
 		{Key: 'K', Label: "Kill"},
+		{Key: 'e', Label: "Exec"},
 		{Key: '/', Label: "Filter"},
 		{Key: 'q', Label: "Quit"},
 	}
@@ -479,6 +482,11 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 				p.pendingG = false
 				p.table.MoveSelection(-1)
 
+			// Toggle group collapse (vim-style l / h)
+			case "l", "h":
+				p.pendingG = false
+				p.toggleGroup()
+
 			// Vim: gg → top, G → bottom
 			case "g":
 				if p.pendingG {
@@ -533,6 +541,10 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 				if p.activeTab == 0 {
 					return p, p.doAction("kill", p.dockerClient.KillContainer)
 				}
+			case "e":
+				if p.activeTab == 0 {
+					return p, p.doExec()
+				}
 
 			// ── Network actions ────────────────────
 			case "I":
@@ -583,8 +595,8 @@ func (p Pane) View() string {
 	if p.searchMode {
 		searchBarH = 1
 	}
-	// tabBar(1) + content(header+data) + divider(1) + actionBar(1) = 3 fixed lines
-	contentH := innerH - 3 - searchBarH
+	// Fixed chrome: tabBar(1) + topDivider(1) + bottomDivider(1) + actionBar(1) = 4
+	contentH := innerH - 4 - searchBarH
 	if contentH < 1 {
 		contentH = 1
 	}
@@ -749,20 +761,19 @@ func (p *Pane) toggleGroup() {
 }
 
 func (p *Pane) recalcTable() {
-	// Fixed chrome: borders(2) + tabBar(1) + divider(1) + actionBar(1)
-	// The bottom divider is part of the content area (table header separator
-	// doubles as the divider), so we save 1 line.
+	// Fixed chrome: borders(2) + tabBar(1) + topDivider(1) +
+	// bottomDivider(1) + actionBar(1) = 6.  Table output adds
+	// header(1) + tableDivider(1) = 2 more.
 	searchH := 0
 	if p.searchMode {
 		searchH = 1
 	}
-	contentH := p.height - 2 - 1 - 1 - 1 - searchH
+	contentH := p.height - 6 - searchH
 	if contentH < 1 {
 		contentH = 1
 	}
-	// Table renders: header(1) + dataH rows = contentH
-	// (the table's own divider line shares space with the UI divider)
-	dataH := contentH - 1
+	// Table renders: header(1) + divider(1) + dataH rows = contentH
+	dataH := contentH - 2
 	if dataH < 1 {
 		dataH = 1
 	}
@@ -1051,6 +1062,24 @@ func (p Pane) doAction(action string, fn func(string) error) tea.Cmd {
 		err := fn(name)
 		return actionExecutedMsg{action: action, name: name, err: err}
 	}
+}
+
+// doExec suspends the TUI, spawns an interactive shell inside the
+// currently selected container via `docker exec -it`, and resumes
+// the TUI when the shell exits.
+func (p Pane) doExec() tea.Cmd {
+	name := p.SelectedContainer()
+	if name == "" {
+		return nil
+	}
+	return tea.Sequence(
+		tea.ExitAltScreen,
+		tea.ExecProcess(
+			exec.Command("docker", "exec", "-it", name, "sh"),
+			nil,
+		),
+		tea.EnterAltScreen,
+	)
 }
 
 // ── Search ────────────────────────────────────────────────────────
