@@ -257,12 +257,35 @@ func (t *Table) MoveSelection(delta int) {
 		return
 	}
 
-	newSel := t.selected + delta
-	if newSel < 0 {
-		newSel = 0
+	// Skip separator rows (they are not selectable).
+	newSel := t.selected
+	step := 1
+	if delta < 0 {
+		step = -1
 	}
-	if newSel >= len(t.rows) {
-		newSel = len(t.rows) - 1
+	for i := 0; i < abs(delta); i++ {
+		newSel += step
+		if newSel < 0 {
+			newSel = 0
+			break
+		}
+		if newSel >= len(t.rows) {
+			newSel = len(t.rows) - 1
+			break
+		}
+		// Skip separators — keep moving in the same direction.
+		for newSel > 0 && newSel < len(t.rows) && t.rows[newSel].Type == RowSeparator {
+			newSel += step
+		}
+		// If we landed past bounds after skipping, clamp.
+		if newSel < 0 {
+			newSel = 0
+			break
+		}
+		if newSel >= len(t.rows) {
+			newSel = len(t.rows) - 1
+			break
+		}
 	}
 	t.selected = newSel
 	t.scrollToVisible()
@@ -465,4 +488,12 @@ func fit(s string, w int) string {
 		return string(runes[:w])
 	}
 	return s + strings.Repeat(" ", w-len(runes))
+}
+
+// abs returns the absolute value of x.
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

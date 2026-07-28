@@ -587,7 +587,17 @@ func (p Pane) View() string {
 	tabBar := p.renderTabBar(innerW)
 
 	// ── Divider ──────────────────────────────────────
-	divider := p.renderDivider(innerW)
+	tabDivider := p.renderDivider(innerW)
+
+	// ── Action bar (top, only when pane is focused) ──
+	var actionBar string
+	var actionDivider string
+	actionBarH := 0
+	if p.focused {
+		actionBar = p.renderActionBar(innerW)
+		actionDivider = p.renderDivider(innerW)
+		actionBarH = 2
+	}
 
 	// ── Content area ─────────────────────────────────
 	// Reserve space for search bar when active
@@ -595,8 +605,8 @@ func (p Pane) View() string {
 	if p.searchMode {
 		searchBarH = 1
 	}
-	// Fixed chrome: tabBar(1) + topDivider(1) + bottomDivider(1) + actionBar(1) = 4
-	contentH := innerH - 4 - searchBarH
+	// Fixed chrome: tabBar(1) + tabDivider(1) + [actionBar + actionDivider](0 or 2)
+	contentH := innerH - 2 - actionBarH - searchBarH
 	if contentH < 1 {
 		contentH = 1
 	}
@@ -621,15 +631,15 @@ func (p Pane) View() string {
 		searchBar = p.renderSearchBar(innerW)
 	}
 
-	// ── Action bar ───────────────────────────────────
-	actionBar := p.renderActionBar(innerW)
-
 	// ── Assemble inner content ───────────────────────
-	parts := []string{tabBar, divider, contentArea}
+	parts := []string{tabBar, tabDivider}
+	if p.focused {
+		parts = append(parts, actionBar, actionDivider)
+	}
+	parts = append(parts, contentArea)
 	if p.searchMode {
 		parts = append(parts, searchBar)
 	}
-	parts = append(parts, divider, actionBar)
 	inner := lipgloss.JoinVertical(lipgloss.Top, parts...)
 
 	// ── Wrap with border ─────────────────────────────
@@ -761,14 +771,18 @@ func (p *Pane) toggleGroup() {
 }
 
 func (p *Pane) recalcTable() {
-	// Fixed chrome: borders(2) + tabBar(1) + topDivider(1) +
-	// bottomDivider(1) + actionBar(1) = 6.  Table output adds
-	// header(1) + tableDivider(1) = 2 more.
+	// Fixed chrome: borders(2) + tabBar(1) + tabDivider(1) +
+	// [actionBar + actionDivider](0 or 2) = 4 or 6.
+	// Table output adds header(1) + tableDivider(1) = 2 more.
+	actionChrome := 0
+	if p.focused {
+		actionChrome = 2
+	}
 	searchH := 0
 	if p.searchMode {
 		searchH = 1
 	}
-	contentH := p.height - 6 - searchH
+	contentH := p.height - 4 - actionChrome - searchH
 	if contentH < 1 {
 		contentH = 1
 	}
@@ -1335,6 +1349,13 @@ func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[s
 			Type:    RowGroup,
 			GroupID: groupID,
 		}
+		// ── Separator between groups ───────────────────
+		if len(rows) > 0 {
+			rows = append(rows, Row{
+				Type: RowSeparator,
+			})
+		}
+
 		rows = append(rows, headerRow)
 
 		if collapsed[groupID] {

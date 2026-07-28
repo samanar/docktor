@@ -271,12 +271,29 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// ── Pane navigation (focus 1) ─────────────────
 		if m.focus == 1 {
+			// Enter on a data row (not a group header) should
+			// move focus to the logs / detail pane.
+			isEnter := msg.Type == tea.KeyEnter
+
 			prevContainer := m.selectedName
 			prevNetwork := m.selectedNetworkName
 			prevImgID := m.selectedImageID
 			prevVol := m.selectedVolume
 			var cmd tea.Cmd
 			m.pane, cmd = m.pane.Update(msg)
+
+			// Enter on a container / image / volume / network row
+			// switches focus to the bottom detail pane.
+			if isEnter {
+				if m.pane.SelectedContainer() != "" ||
+					m.pane.SelectedImage() != "" ||
+					m.pane.SelectedVolume() != "" ||
+					m.pane.SelectedNetwork() != "" {
+					m.focus = 3
+					m.pane.focused = false
+					return m, cmd
+				}
+			}
 
 			// Check for container selection change
 			newContainer := m.pane.SelectedContainer()
@@ -422,6 +439,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "N":
 					m.prevLogSearchMatch()
 				case "esc":
+					m.logLines = nil
 					m.clearLogSearch()
 				}
 			}
@@ -607,15 +625,36 @@ func (m AppModel) View() string {
 		bottomW := m.width - 2
 		bottomH := bottomHeight - 2
 
-		if m.pane.ActiveTabKey() == 'N' {
-			bottomView = bottomStyle.Render(m.renderNetworkDetail(bottomW, bottomH))
-		} else if m.pane.ActiveTabKey() == 'i' && len(m.imageLayers) > 0 {
-			bottomView = bottomStyle.Render(m.renderImageLayers(bottomW, bottomH))
-		} else if m.pane.ActiveTab() == 2 && m.selectedVolume != "" {
-			bottomView = bottomStyle.Render(m.renderVolumeFileUsage(bottomW, bottomH))
-		} else {
-			bottomView = bottomStyle.Render(m.renderLogs(bottomW, bottomH))
+		// Action bar at top when bottom pane is focused.
+		actionBarH := 0
+		if m.focus == 3 {
+			actionBarH = 2 // action bar + divider
 		}
+		contentH := bottomH - actionBarH
+		if contentH < 1 {
+			contentH = 1
+		}
+
+		var bottomContent string
+		if m.pane.ActiveTabKey() == 'N' {
+			bottomContent = m.renderNetworkDetail(bottomW, contentH)
+		} else if m.pane.ActiveTabKey() == 'i' && len(m.imageLayers) > 0 {
+			bottomContent = m.renderImageLayers(bottomW, contentH)
+		} else if m.pane.ActiveTab() == 2 && m.selectedVolume != "" {
+			bottomContent = m.renderVolumeFileUsage(bottomW, contentH)
+		} else {
+			bottomContent = m.renderLogs(bottomW, contentH)
+		}
+
+		if m.focus == 3 {
+			actionBar := m.renderLogActionBar(bottomW)
+			divider := lipgloss.NewStyle().
+				Foreground(m.theme.DividerLine).
+				Render(strings.Repeat("─", bottomW))
+			bottomContent = lipgloss.JoinVertical(lipgloss.Top, actionBar, divider, bottomContent)
+		}
+
+		bottomView = bottomStyle.Render(bottomContent)
 	}
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, paneView, rightView)
@@ -641,14 +680,12 @@ func (m AppModel) renderLogs(width, height int) string {
 			Render("Select a container to view logs")
 	}
 
-	// Reserve bottom rows: always 1 for action hints,
-	// +1 for status bar when follow or search is active.
-	actionH := 1
+	// Reserve bottom row for status bar when follow or search is active.
 	statusH := 0
 	if m.followMode || m.logSearchQuery != "" {
 		statusH = 1
 	}
-	logH := height - actionH - statusH
+	logH := height - statusH
 	if logH < 1 {
 		logH = 1
 	}
@@ -713,9 +750,6 @@ func (m AppModel) renderLogs(width, height int) string {
 	if statusH > 0 {
 		result += "\n" + m.renderLogStatusBar(width)
 	}
-
-	// ── Action hints bar (always visible) ────────────
-	result += "\n" + m.renderLogActionBar(width)
 
 	return result
 }
