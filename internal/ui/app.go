@@ -587,16 +587,21 @@ func (m AppModel) View() string {
 				Render("No volume selected\n\n[2 to focus]")
 		}
 	} else {
-		// Container overview
-		ctr := m.pane.GetSelectedContainer()
-		if ctr != nil {
-			rightContent = m.renderOverview(innerW, innerH, ctr)
+		// Container overview — or group overview if a group header is selected.
+		grp := m.pane.GetSelectedGroup()
+		if grp != nil {
+			rightContent = m.renderGroupOverview(innerW, innerH, grp)
 		} else {
-			rightContent = lipgloss.NewStyle().
-				Width(innerW).Height(innerH).
-				Align(lipgloss.Center, lipgloss.Center).
-				Foreground(m.theme.TabInactive).
-				Render("No container selected\n\n[2 to focus]")
+			ctr := m.pane.GetSelectedContainer()
+			if ctr != nil {
+				rightContent = m.renderOverview(innerW, innerH, ctr)
+			} else {
+				rightContent = lipgloss.NewStyle().
+					Width(innerW).Height(innerH).
+					Align(lipgloss.Center, lipgloss.Center).
+					Foreground(m.theme.TabInactive).
+					Render("No container selected\n\n[2 to focus]")
+			}
 		}
 	}
 
@@ -1342,6 +1347,169 @@ func (m AppModel) renderOverview(width, height int, ctr *docker.Container) strin
 	return strings.Join(lines, "\n")
 }
 
+// ── Group / Compose overview ──────────────────────────────────────
+
+func (m AppModel) renderGroupOverview(width, height int, grp *docker.ContainerGroup) string {
+	if width < 10 || height < 3 {
+		return ""
+	}
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TabInactive).
+		Width(10)
+
+	valueStyle := lipgloss.NewStyle().
+		Foreground(m.theme.Foreground).
+		Width(width - 12)
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.theme.TitleText).
+		Bold(true).
+		Width(width)
+
+	divider := lipgloss.NewStyle().
+		Foreground(m.theme.DividerLine).
+		Render(strings.Repeat("─", width))
+
+	row := func(label, value string) string {
+		l := labelStyle.Render(label)
+		v := valueStyle.Render(value)
+		return l + v
+	}
+
+	// Status styles
+	green := lipgloss.NewStyle().Foreground(m.theme.StatusRunning)
+	red := lipgloss.NewStyle().Foreground(m.theme.StatusStopped)
+	grey := lipgloss.NewStyle().Foreground(m.theme.TabInactive)
+
+	var b strings.Builder
+
+	// ── Title ────────────────────────────────────────
+	label := grp.Project
+	if label == "" {
+		label = "Other"
+	}
+	b.WriteString(titleStyle.Render(label))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// ── Compose file ─────────────────────────────────
+	if grp.ComposeFile != "" {
+		b.WriteString(row("Compose:", grp.ComposeFile))
+		b.WriteString("\n")
+	}
+
+	// ── Counts ───────────────────────────────────────
+	running, healthy, exited, stopped := 0, 0, 0, 0
+	for _, c := range grp.Containers {
+		switch c.State {
+		case "running":
+			running++
+		case "healthy":
+			healthy++
+		case "exited", "dead", "removing":
+			exited++
+		default:
+			stopped++
+		}
+	}
+	up := running + healthy
+	total := len(grp.Containers)
+
+	var countParts []string
+	if up > 0 {
+		countParts = append(countParts, green.Render(fmt.Sprintf("%d up", up)))
+	}
+	if exited > 0 {
+		countParts = append(countParts, red.Render(fmt.Sprintf("%d exited", exited)))
+	}
+	if stopped > 0 {
+		countParts = append(countParts, grey.Render(fmt.Sprintf("%d stopped", stopped)))
+	}
+	b.WriteString(row("Total:", fmt.Sprintf("%d containers", total)))
+	b.WriteString("\n")
+	if len(countParts) > 0 {
+		b.WriteString(row("Status:", strings.Join(countParts, "  ")))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// ── Aggregate resources ──────────────────────────
+	totalCPU := 0.0
+	var totalMemUsed uint64
+	for _, c := range grp.Containers {
+		totalCPU += parseCPUPercent(c.CPU)
+		used, _ := parseMemoryUsage(c.Memory)
+		totalMemUsed += used
+	}
+	if totalCPU > 0 || totalMemUsed > 0 {
+		b.WriteString(titleStyle.Render("Resources"))
+		b.WriteString("\n")
+		b.WriteString(divider)
+		b.WriteString("\n\n")
+		b.WriteString(row("CPU:", fmt.Sprintf("%.1f%% total", totalCPU)))
+		b.WriteString("\n")
+		b.WriteString(row("Memory:", formatBytes(totalMemUsed)))
+		b.WriteString("\n")
+		b.WriteString("\n")
+		b.WriteString(divider)
+		b.WriteString("\n\n")
+	}
+
+	// ── Container list ───────────────────────────────
+	b.WriteString(titleStyle.Render("Containers"))
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n\n")
+
+	// Compact container rows: dot name  cpu  mem
+	nameW := width - 30
+	if nameW < 8 {
+		nameW = 8
+	}
+	cpuW := 8
+	memW := 16
+
+	for _, c := range grp.Containers {
+		// Status dot
+		var dot string
+		switch c.State {
+		case "running", "healthy":
+			dot = green.Render("●")
+		case "exited", "dead", "removing":
+			dot = red.Render("●")
+		default:
+			dot = grey.Render("●")
+		}
+
+		short := shortenName(c.Name)
+		if len(short) > nameW {
+			short = short[:nameW]
+		}
+		nameStr := lipgloss.NewStyle().Foreground(m.theme.Foreground).Width(nameW).Render(short)
+		cpuStr := lipgloss.NewStyle().Foreground(m.theme.Foreground).Width(cpuW).Render(c.CPU)
+		memStr := lipgloss.NewStyle().Foreground(m.theme.TabInactive).Width(memW).Render(memUsedPortion(c.Memory))
+
+		b.WriteString(fmt.Sprintf(" %s %s %s %s\n", dot, nameStr, cpuStr, memStr))
+	}
+
+	// Pad to height
+	result := b.String()
+	lines := strings.Split(result, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 // ── Image overview ────────────────────────────────────────────────
 
 func (m AppModel) renderImageOverview(width, height int, img *docker.Image) string {
@@ -1987,5 +2155,77 @@ func fetchVolumeUsage(dc *docker.Client, volumeName string) tea.Cmd {
 	return func() tea.Msg {
 		entries, err := dc.GetVolumeFileUsage(volumeName)
 		return volumeUsageLoadedMsg{volumeName: volumeName, entries: entries, err: err}
+	}
+}
+
+// ── Aggregate stats helpers ───────────────────────────────────────
+
+// parseCPUPercent extracts a float64 from a CPU percentage string
+// like "1.23%" or returns 0 for "—".
+func parseCPUPercent(s string) float64 {
+	s = strings.TrimSuffix(s, "%")
+	if s == "—" || s == "" {
+		return 0
+	}
+	var v float64
+	fmt.Sscanf(s, "%f", &v)
+	return v
+}
+
+// parseMemoryUsage splits a memory string like "80MiB / 1.5GiB"
+// into used and limit bytes. Returns 0,0 for "—".
+func parseMemoryUsage(s string) (used, limit uint64) {
+	if s == "—" || s == "" {
+		return 0, 0
+	}
+	parts := strings.SplitN(s, " / ", 2)
+	if len(parts) == 2 {
+		return parseBytes(strings.TrimSpace(parts[0])),
+			parseBytes(strings.TrimSpace(parts[1]))
+	}
+	return 0, 0
+}
+
+// parseBytes converts a human-readable size string like "80MiB"
+// or "1.5GiB" into raw bytes.
+func parseBytes(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0B" {
+		return 0
+	}
+
+	var value float64
+	var unit string
+	fmt.Sscanf(s, "%f%s", &value, &unit)
+
+	switch strings.ToLower(unit) {
+	case "b":
+		return uint64(value)
+	case "kb", "kib":
+		return uint64(value * 1024)
+	case "mb", "mib":
+		return uint64(value * 1024 * 1024)
+	case "gb", "gib":
+		return uint64(value * 1024 * 1024 * 1024)
+	case "tb", "tib":
+		return uint64(value * 1024 * 1024 * 1024 * 1024)
+	default:
+		return uint64(value)
+	}
+}
+
+// formatBytes converts a raw byte count to a human-readable string.
+func formatBytes(b uint64) string {
+	switch {
+	case b >= 1024*1024*1024*1024:
+		return fmt.Sprintf("%.1fTiB", float64(b)/(1024*1024*1024*1024))
+	case b >= 1024*1024*1024:
+		return fmt.Sprintf("%.1fGiB", float64(b)/(1024*1024*1024))
+	case b >= 1024*1024:
+		return fmt.Sprintf("%.1fMiB", float64(b)/(1024*1024))
+	case b >= 1024:
+		return fmt.Sprintf("%.1fKiB", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%dB", b)
 	}
 }

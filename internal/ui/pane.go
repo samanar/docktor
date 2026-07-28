@@ -1023,6 +1023,26 @@ func (p Pane) GetSelectedContainer() *docker.Container {
 	return nil
 }
 
+// GetSelectedGroup returns the ContainerGroup for the currently
+// highlighted group header, or nil if a container row is selected
+// or the containers tab is not active.
+func (p Pane) GetSelectedGroup() *docker.ContainerGroup {
+	if p.activeTab != 0 {
+		return nil
+	}
+	sel := p.table.HighlightedRow()
+	if p.table.RowTypeAt(sel) != RowGroup {
+		return nil
+	}
+	gid := p.table.GroupIDAt(sel)
+	for i := range p.groups {
+		if "group:"+p.groups[i].Project == gid {
+			return &p.groups[i]
+		}
+	}
+	return nil
+}
+
 // SelectedImage returns the repo:tag of the currently highlighted
 // image, or empty string if none is selected or on a different tab.
 func (p Pane) SelectedImage() string {
@@ -1430,13 +1450,61 @@ func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[s
 		if composeLoadingID == groupID {
 			toggle = spinnerFrames[spinnerIdx%len(spinnerFrames)]
 		}
+
+		// ── Health summary for compose groups ──────────
+		var healthDot Cell
 		title := fmt.Sprintf("%s %s (%d)", toggle, label, count)
+		statusSummary := ""
+
+		if g.ComposeFile != "" && label != "Other" {
+			running, healthy, exited, stopped := 0, 0, 0, 0
+			for _, c := range g.Containers {
+				switch c.State {
+				case "running":
+					running++
+				case "healthy":
+					healthy++
+				case "exited", "dead", "removing":
+					exited++
+				default:
+					stopped++
+				}
+			}
+			up := running + healthy
+			down := exited + stopped
+
+			// Health dot: green = all up, amber = mixed, red = all down.
+			switch {
+			case up == count:
+				healthDot = Cell{Value: "●", Style: iconRunning}
+			case up > 0:
+				healthDot = Cell{Value: "●", Style: iconAmber}
+			case count > 0:
+				healthDot = Cell{Value: "●", Style: iconRed}
+			default:
+				healthDot = Cell{Value: "●", Style: iconStopped}
+			}
+
+			title = fmt.Sprintf("%s %s (%d/%d up)", toggle, label, up, count)
+
+			// Status breakdown for mixed states.
+			if down > 0 {
+				var parts []string
+				if exited > 0 {
+					parts = append(parts, fmt.Sprintf("%d exited", exited))
+				}
+				if stopped > 0 {
+					parts = append(parts, fmt.Sprintf("%d stopped", stopped))
+				}
+				statusSummary = strings.Join(parts, " ")
+			}
+		}
 
 		headerRow := Row{
 			Cells: map[string]Cell{
-				colIcon:      {Value: ""},
+				colIcon:      healthDot,
 				colName:      {Value: title},
-				colStatus:    {Value: ""},
+				colStatus:    {Value: statusSummary, Style: dimStyle},
 				colCPUMem:    {Value: ""},
 				colPorts:     {Value: ""},
 				colBuilt:     {Value: ""},
