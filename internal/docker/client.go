@@ -898,6 +898,20 @@ func runDockerCLI(args ...string) (string, error) {
 	return string(out), nil
 }
 
+// runShellCmd executes a command through the shell, allowing pipe
+// and $() substitution syntax.
+func runShellCmd(command string) (string, error) {
+	cmd := exec.Command("sh", "-c", command)
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("%s", strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return "", fmt.Errorf("failed to run shell command: %w", err)
+	}
+	return string(out), nil
+}
+
 // IsDockerAvailable returns nil if Docker CLI and daemon are
 // reachable, or an error describing the problem.
 func IsDockerAvailable() error {
@@ -974,6 +988,24 @@ func (c *Client) ComposeRestart(composeFile string) error {
 	dir := strings.TrimSuffix(composeFile, "/docker-compose.yml")
 	_, err := runDockerCLI("compose", "-f", composeFile, "--project-directory", dir, "restart")
 	return err
+}
+
+// ── Bulk actions ─────────────────────────────────────────────────
+
+// StopAllContainers stops all running containers.
+func (c *Client) StopAllContainers() (string, error) {
+	return runShellCmd("docker stop $(docker ps -q)")
+}
+
+// RemoveAllContainers removes all containers (uses -f to force).
+func (c *Client) RemoveAllContainers() (string, error) {
+	return runShellCmd("docker rm -f $(docker ps -aq)")
+}
+
+// PruneContainers removes all stopped containers, unused networks,
+// dangling images, and build cache.
+func (c *Client) PruneContainers() (string, error) {
+	return runDockerCLI("container", "prune", "-f")
 }
 
 // groupByProject buckets containers by Compose project. Any container

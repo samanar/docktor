@@ -58,6 +58,15 @@ type AppModel struct {
 	logSearchQuery    string // current search term
 	logSearchMatches  []int  // indices into logLines that match
 	logSearchMatchIdx int    // current position within matches
+
+	// ── Bulk actions dialog ──────────────────────────
+	bulkDialogOpen    bool
+	bulkDialogIdx     int
+	bulkActionLoading bool
+	bulkActionLabel   string
+	bulkSpinnerIdx    int
+	bulkActionResult  string
+	bulkActionErr     error
 }
 
 // NewApp creates the root application model with the given theme.
@@ -115,6 +124,14 @@ type logLineMsg struct {
 type logStreamEndedMsg struct {
 	containerName string
 	err           error
+}
+
+// bulkActionResultMsg is sent when a bulk action (stop all, remove
+// all, prune) completes.
+type bulkActionResultMsg struct {
+	action string
+	output string
+	err    error
 }
 
 // ── Bubble Tea Model ─────────────────────────────────────────────
@@ -246,8 +263,49 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh pane after network prune
 		return m, m.pane.Init()
 
+	// ── Bulk action completed ──────────────────────
+	case bulkActionResultMsg:
+		m.bulkActionLoading = false
+		m.bulkDialogOpen = false
+		if msg.err != nil {
+			m.bulkActionErr = msg.err
+			m.bulkActionResult = ""
+		} else {
+			m.bulkActionErr = nil
+			m.bulkActionResult = msg.output
+		}
+		// Refresh containers after bulk action
+		return m, m.pane.Init()
+
 	// ── Keyboard ─────────────────────────────────────
 	case tea.KeyMsg:
+		// ── Bulk dialog navigation (takes priority) ──
+		if m.bulkDialogOpen {
+			// Block interaction while a bulk action is running.
+			if m.bulkActionLoading {
+				return m, nil
+			}
+			switch msg.String() {
+			case "esc", "q":
+				m.bulkDialogOpen = false
+				m.bulkActionResult = ""
+				m.bulkActionErr = nil
+				return m, nil
+			case "j", "down":
+				m.bulkDialogIdx = (m.bulkDialogIdx + 1) % 3
+				return m, nil
+			case "k", "up":
+				m.bulkDialogIdx = (m.bulkDialogIdx - 1 + 3) % 3
+				return m, nil
+			case "enter":
+				a := bulkActions[m.bulkDialogIdx]
+				m.bulkActionLoading = true
+				m.bulkActionLabel = a.label
+				m.bulkSpinnerIdx = 0
+				return m, m.executeBulkAction(m.bulkDialogIdx)
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -270,6 +328,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			m.focus = (m.focus % 3) + 1
 			m.pane.focused = (m.focus == 1)
+			return m, nil
+		case "b":
+			m.bulkDialogOpen = true
+			m.bulkDialogIdx = 0
+			m.bulkActionResult = ""
+			m.bulkActionErr = nil
 			return m, nil
 		}
 
@@ -454,6 +518,19 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── All other messages → pane (stats, data, etc.) ─
+
+	// Intercept spinner ticks to animate the bulk-action spinner.
+	if m.bulkActionLoading {
+		if _, ok := msg.(spinnerTickMsg); ok {
+			m.bulkSpinnerIdx = (m.bulkSpinnerIdx + 1) % len(spinnerFrames)
+			return m, spinnerTick()
+		}
+		// While loading, drop all other messages except
+		// bulkActionResultMsg (handled above) and WindowSize.
+		if _, ok := msg.(tea.WindowSizeMsg); !ok {
+			return m, nil
+		}
+	}
 	prevContainer := m.selectedName
 	prevNetwork := m.selectedNetworkName
 	prevImgID := m.selectedImageID
@@ -616,7 +693,9 @@ func (m AppModel) View() string {
 	rightView := rightStyle.Render(rightContent)
 
 	// ── Bottom pane (logs / detail) ──────────────────
-	bottomHeight := m.height - paneHeight
+	// Reserve 1 line at the very bottom for the global action bar.
+	globalBarH := 1
+	bottomHeight := m.height - paneHeight - globalBarH
 	var bottomView string
 	if bottomHeight > 0 {
 		bottomBorder := m.theme.BorderInactive
@@ -668,10 +747,23 @@ func (m AppModel) View() string {
 
 	topRow := lipgloss.JoinHorizontal(lipgloss.Top, paneView, rightView)
 
+	// ── Global action bar (always visible at the very bottom) ──
+	globalBar := m.renderGlobalActionBar(m.width)
+
+	var mainView string
 	if bottomView != "" {
-		return lipgloss.JoinVertical(lipgloss.Top, topRow, bottomView)
+		mainView = lipgloss.JoinVertical(lipgloss.Top, topRow, bottomView, globalBar)
+	} else {
+		mainView = lipgloss.JoinVertical(lipgloss.Top, topRow, globalBar)
 	}
-	return topRow
+
+	// ── Bulk actions dialog (centered overlay) ────────
+	if m.bulkDialogOpen {
+		dialog := m.renderBulkDialog()
+		return overlayDialog(mainView, dialog, m.width, m.height)
+	}
+
+	return mainView
 }
 
 // ── Log viewer ───────────────────────────────────────────────────
@@ -895,6 +987,240 @@ func (m AppModel) renderLogActionBar(width int) string {
 		Background(m.theme.ActionBarBackground).
 		Padding(0, 1).
 		Render(bar)
+}
+
+// renderGlobalActionBar draws a persistent keybinding bar at the
+// very bottom of the screen, visible regardless of which pane
+// has focus.  Modeled after lazy docker's bottom status bar.
+func (m AppModel) renderGlobalActionBar(width int) string {
+	type hint struct{ key, label string }
+	hints := []hint{
+		{"b", "Bulk Actions"},
+		{"1", "List"},
+		{"2", "Overview"},
+		{"3", "Logs"},
+		{"q", "Quit"},
+	}
+
+	keyStyle := lipgloss.NewStyle().
+		Foreground(m.theme.ActionKey).
+		Bold(true).
+		Background(m.theme.ActionBarBackground)
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(m.theme.ActionLabel).
+		Background(m.theme.ActionBarBackground)
+
+	sep := lipgloss.NewStyle().
+		Foreground(m.theme.ActionSeparator).
+		Background(m.theme.ActionBarBackground).
+		Render("  ")
+
+	var parts []string
+	for _, h := range hints {
+		parts = append(parts, keyStyle.Render(h.key)+":"+labelStyle.Render(h.label))
+	}
+
+	bar := strings.Join(parts, sep)
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Background(m.theme.ActionBarBackground).
+		Padding(0, 1).
+		Render(bar)
+}
+
+// ── Dialog overlay helper ────────────────────────────────────────
+
+// overlayDialog splices the dialog string into the center of the main
+// view without covering the entire screen.  It preserves the main view
+// content around the dialog edges so the user can still see what is
+// behind it (the panes are dimmed but visible).
+func overlayDialog(mainView, dialog string, totalW, totalH int) string {
+	mainLines := strings.Split(mainView, "\n")
+	dialogLines := strings.Split(dialog, "\n")
+	if len(dialogLines) == 0 {
+		return mainView
+	}
+
+	dialogW := lipgloss.Width(dialogLines[0])
+	dialogH := len(dialogLines)
+
+	colOff := (totalW - dialogW) / 2
+	if colOff < 0 {
+		colOff = 0
+	}
+	rowOff := (totalH - dialogH) / 2
+	if rowOff < 0 {
+		rowOff = 0
+	}
+
+	// Pad mainLines so we have enough rows for the overlay.
+	for len(mainLines) < totalH {
+		mainLines = append(mainLines, "")
+	}
+
+	leftPad := strings.Repeat(" ", colOff)
+	rightPadW := totalW - colOff - dialogW
+	if rightPadW < 0 {
+		rightPadW = 0
+	}
+
+	for i, dl := range dialogLines {
+		targetRow := rowOff + i
+		if targetRow >= len(mainLines) {
+			break
+		}
+		// Build the overlaid row: spaces | dialog | truncated main content.
+		right := mainLines[targetRow]
+		right = ansiDrop(right, colOff+dialogW)
+		if rightPadW > 0 {
+			right = lipgloss.NewStyle().Width(rightPadW).Render(right)
+		}
+		mainLines[targetRow] = leftPad + dl + right
+	}
+
+	return strings.Join(mainLines, "\n")
+}
+
+// ansiDrop skips the first n visual columns of s, returning the
+// remainder with any ANSI sequences preserved.  It also emits a
+// reset sequence first so that colors from the skipped portion
+// don't bleed into the result.
+func ansiDrop(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	visual := 0
+	inEsc := false
+	for i, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			continue
+		}
+		if inEsc {
+			if r >= '@' && r <= '~' {
+				inEsc = false
+			}
+			continue
+		}
+		visual++
+		if visual >= n {
+			return s[i+len(string(r)):]
+		}
+	}
+	return ""
+}
+
+// ── Bulk actions ─────────────────────────────────────────────────
+
+// bulkActions is the ordered list of actions shown in the bulk
+// actions dialog.
+var bulkActions = []struct {
+	label  string
+	action func(*docker.Client) (string, error)
+}{
+	{"Stop All Containers", func(dc *docker.Client) (string, error) { return dc.StopAllContainers() }},
+	{"Remove All Containers", func(dc *docker.Client) (string, error) { return dc.RemoveAllContainers() }},
+	{"Prune Exited Containers", func(dc *docker.Client) (string, error) { return dc.PruneContainers() }},
+}
+
+// executeBulkAction runs the selected bulk action asynchronously
+// and returns a tea.Cmd that delivers the result.
+// Caller must set bulkActionLoading / bulkActionLabel / bulkSpinnerIdx
+// before calling this method.
+func (m AppModel) executeBulkAction(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(bulkActions) {
+		return nil
+	}
+	a := bulkActions[idx]
+	return tea.Batch(
+		func() tea.Msg {
+			output, err := a.action(m.dc)
+			return bulkActionResultMsg{action: a.label, output: output, err: err}
+		},
+		spinnerTick(),
+	)
+}
+
+// renderBulkDialog returns a styled modal dialog for bulk actions.
+func (m AppModel) renderBulkDialog() string {
+	dialogW := 40
+
+	// ── Content ──────────────────────────────────────
+	title := lipgloss.NewStyle().
+		Foreground(m.theme.TabActive).
+		Bold(true).
+		Align(lipgloss.Center).
+		Width(dialogW - 4).
+		Render("Bulk Actions")
+
+	divider := lipgloss.NewStyle().
+		Foreground(m.theme.DividerLine).
+		Render(strings.Repeat("─", dialogW-4))
+
+	var body string
+	var footer string
+
+	if m.bulkActionLoading {
+		// ── Loading spinner ──────────────────────────
+		spinner := spinnerFrames[m.bulkSpinnerIdx%len(spinnerFrames)]
+		body = lipgloss.NewStyle().
+			Foreground(m.theme.TabActive).
+			Align(lipgloss.Center).
+			Width(dialogW - 4).
+			Render(spinner + " " + m.bulkActionLabel + "...")
+
+		footer = lipgloss.NewStyle().
+			Foreground(m.theme.TabInactive).
+			Align(lipgloss.Center).
+			Width(dialogW - 4).
+			Render("please wait...")
+	} else {
+		// ── Build option lines ───────────────────────
+		var options []string
+		for i, a := range bulkActions {
+			prefix := "  "
+			if i == m.bulkDialogIdx {
+				prefix = "▸ "
+			}
+			line := prefix + a.label
+			if i == m.bulkDialogIdx {
+				options = append(options, lipgloss.NewStyle().
+					Foreground(m.theme.ActionKey).
+					Bold(true).
+					Render(line))
+			} else {
+				options = append(options, lipgloss.NewStyle().
+					Foreground(m.theme.Foreground).
+					Render(line))
+			}
+		}
+		body = strings.Join(options, "\n")
+
+		footer = lipgloss.NewStyle().
+			Foreground(m.theme.TabInactive).
+			Align(lipgloss.Center).
+			Width(dialogW - 4).
+			Render("↑↓ navigate  ↵ select  esc close")
+	}
+
+	content := lipgloss.JoinVertical(
+		lipgloss.Center,
+		title,
+		divider,
+		body,
+		"",
+		footer,
+	)
+
+	return lipgloss.NewStyle().
+		Width(dialogW).
+		Padding(1, 2).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.BorderFocused).
+		Background(m.theme.Background).
+		Render(content)
 }
 
 // ── Network overview pane ────────────────────────────────────────
