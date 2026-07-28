@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -46,6 +47,17 @@ type AppModel struct {
 	volumeFileUsage   []docker.VolumeFileUsage
 	volumeUsageErr    error
 	selectedVolumeObj *docker.Volume
+
+	// ── Follow (streaming logs) ──────────────────────
+	followMode bool               // true = streaming logs live
+	logCancel  context.CancelFunc // cancels the docker logs -f subprocess
+	logLineCh  chan string        // new log lines from the goroutine
+
+	// ── Log search ───────────────────────────────────
+	logSearchMode     bool   // true when / search is active in logs
+	logSearchQuery    string // current search term
+	logSearchMatches  []int  // indices into logLines that match
+	logSearchMatchIdx int    // current position within matches
 }
 
 // NewApp creates the root application model with the given theme.
@@ -92,6 +104,19 @@ type volumeUsageLoadedMsg struct {
 	err        error
 }
 
+// logLineMsg carries a single line from a running docker logs -f
+// stream. Sent by the follow-logs goroutine.
+type logLineMsg struct {
+	containerName string
+	line          string
+}
+
+// logStreamEndedMsg is sent when the docker logs -f subprocess exits.
+type logStreamEndedMsg struct {
+	containerName string
+	err           error
+}
+
 // ── Bubble Tea Model ─────────────────────────────────────────────
 
 func (m AppModel) Init() tea.Cmd {
@@ -133,6 +158,24 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		return m, nil
+
+	// ── Streamed log line arrived ────────────────────
+	case logLineMsg:
+		m.logLines = append(m.logLines, msg.line)
+		// Rebuild search matches if search is active
+		if m.logSearchQuery != "" {
+			m.rebuildLogSearchMatches()
+		}
+		if m.logAutoScroll {
+			m.scrollLogsToEnd()
+		}
+		// Keep reading more lines
+		return m, waitForLogLine(m.logLineCh)
+
+	// ── Log stream ended ─────────────────────────────
+	case logStreamEndedMsg:
+		m.followMode = false
 		return m, nil
 
 	// ── Image size arrived ───────────────────────────
@@ -202,7 +245,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Keyboard ─────────────────────────────────────
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "q", "ctrl+c", "esc":
+		case "q", "ctrl+c":
 			return m, tea.Quit
 		}
 
@@ -238,6 +281,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Check for container selection change
 			newContainer := m.pane.SelectedContainer()
 			if newContainer != "" && newContainer != prevContainer {
+				m.stopFollowLogs()
+				m.clearLogSearch()
 				m.selectedName = newContainer
 				m.selectedNetworkName = ""
 				m.selectedImageID = ""
@@ -300,6 +345,29 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// ── Log / detail scrolling (focus 3) ───────────
 		if m.focus == 3 {
+			// Handle search mode in logs
+			if m.logSearchMode {
+				switch msg.Type {
+				case tea.KeyEscape:
+					m.logSearchMode = false
+					return m, nil
+				case tea.KeyEnter:
+					m.logSearchMode = false
+					return m, nil
+				case tea.KeyBackspace:
+					if len(m.logSearchQuery) > 0 {
+						m.logSearchQuery = m.logSearchQuery[:len(m.logSearchQuery)-1]
+						m.doLogSearch()
+					}
+					return m, nil
+				case tea.KeyRunes:
+					m.logSearchQuery += string(msg.Runes)
+					m.doLogSearch()
+					return m, nil
+				}
+				return m, nil
+			}
+
 			if m.pane.ActiveTabKey() == 'N' {
 				// Network detail scrolling
 				switch msg.String() {
@@ -335,6 +403,26 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scrollLogsDownHalf()
 				case "ctrl+u":
 					m.scrollLogsUpHalf()
+				// ── Follow mode ──────────────────────
+				case "F":
+					if m.followMode {
+						m.stopFollowLogs()
+					} else {
+						return m, m.startFollowLogs()
+					}
+				// ── Log search ──────────────────────
+				case "/":
+					m.logSearchMode = true
+					m.logSearchQuery = ""
+					m.logSearchMatches = nil
+					m.logSearchMatchIdx = 0
+					return m, nil
+				case "n":
+					m.nextLogSearchMatch()
+				case "N":
+					m.prevLogSearchMatch()
+				case "esc":
+					m.clearLogSearch()
 				}
 			}
 			return m, nil
@@ -353,6 +441,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	newContainer := m.pane.SelectedContainer()
 	if newContainer != "" && newContainer != prevContainer {
+		m.stopFollowLogs()
+		m.clearLogSearch()
 		m.selectedName = newContainer
 		m.selectedNetworkName = ""
 		m.selectedImageID = ""
@@ -551,8 +641,20 @@ func (m AppModel) renderLogs(width, height int) string {
 			Render("Select a container to view logs")
 	}
 
+	// Reserve bottom rows: always 1 for action hints,
+	// +1 for status bar when follow or search is active.
+	actionH := 1
+	statusH := 0
+	if m.followMode || m.logSearchQuery != "" {
+		statusH = 1
+	}
+	logH := height - actionH - statusH
+	if logH < 1 {
+		logH = 1
+	}
+
 	// Clamp scroll offset
-	maxOff := len(m.logLines) - height
+	maxOff := len(m.logLines) - logH
 	if maxOff < 0 {
 		maxOff = 0
 	}
@@ -563,7 +665,7 @@ func (m AppModel) renderLogs(width, height int) string {
 		m.logScrollOff = 0
 	}
 
-	end := m.logScrollOff + height
+	end := m.logScrollOff + logH
 	if end > len(m.logLines) {
 		end = len(m.logLines)
 	}
@@ -571,21 +673,185 @@ func (m AppModel) renderLogs(width, height int) string {
 	visible := m.logLines[m.logScrollOff:end]
 
 	// Pad to full height
-	for len(visible) < height {
+	for len(visible) < logH {
 		visible = append(visible, "")
 	}
 
-	// Truncate long lines to width
+	// Render visible lines with optional search highlighting
 	lineStyle := lipgloss.NewStyle().
 		Foreground(m.theme.Foreground).
 		Width(width)
 
+	matchStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("0")).
+		Background(lipgloss.Color("11")). // yellow highlight
+		Bold(true)
+
+	currentMatchStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("0")).
+		Background(lipgloss.Color("208")). // orange highlight
+		Bold(true)
+
 	var styled []string
-	for _, line := range visible {
-		styled = append(styled, lineStyle.Render(line))
+	for i, line := range visible {
+		styledLine := line
+		lineIdx := m.logScrollOff + i
+
+		// Highlight search matches within this line
+		if m.logSearchQuery != "" {
+			styledLine = highlightLine(line, m.logSearchQuery, lineIdx,
+				m.logSearchMatches, m.logSearchMatchIdx,
+				matchStyle, currentMatchStyle)
+		}
+
+		styled = append(styled, lineStyle.Render(styledLine))
 	}
 
-	return strings.Join(styled, "\n")
+	result := strings.Join(styled, "\n")
+
+	// ── Status bar (conditional) ─────────────────────
+	if statusH > 0 {
+		result += "\n" + m.renderLogStatusBar(width)
+	}
+
+	// ── Action hints bar (always visible) ────────────
+	result += "\n" + m.renderLogActionBar(width)
+
+	return result
+}
+
+// highlightLine highlights all occurrences of query in line using
+// matchStyle. If lineIdx matches the current search match, it uses
+// currentMatchStyle instead.
+func highlightLine(
+	line, query string,
+	lineIdx int,
+	matches []int,
+	matchIdx int,
+	matchStyle, currentMatchStyle lipgloss.Style,
+) string {
+	if query == "" {
+		return line
+	}
+
+	lower := strings.ToLower(line)
+	q := strings.ToLower(query)
+
+	// Check if this line is the current match
+	isCurrentMatch := false
+	if matchIdx >= 0 && matchIdx < len(matches) && matches[matchIdx] == lineIdx {
+		isCurrentMatch = true
+	}
+
+	var result strings.Builder
+	pos := 0
+	for {
+		idx := strings.Index(lower[pos:], q)
+		if idx < 0 {
+			result.WriteString(line[pos:])
+			break
+		}
+		absIdx := pos + idx
+		// Text before the match
+		result.WriteString(line[pos:absIdx])
+		// The match itself
+		if isCurrentMatch {
+			result.WriteString(currentMatchStyle.Render(line[absIdx : absIdx+len(q)]))
+		} else {
+			result.WriteString(matchStyle.Render(line[absIdx : absIdx+len(q)]))
+		}
+		pos = absIdx + len(q)
+	}
+
+	return result.String()
+}
+
+// renderLogStatusBar draws the bottom bar of the log viewer showing
+// follow-mode indicator and search match count.
+func (m AppModel) renderLogStatusBar(width int) string {
+	bg := lipgloss.NewStyle().
+		Background(m.theme.ActionBarBackground).
+		Width(width)
+
+	var parts []string
+
+	// Follow indicator
+	if m.followMode {
+		parts = append(parts, lipgloss.NewStyle().
+			Foreground(lipgloss.Color("10")).
+			Background(m.theme.ActionBarBackground).
+			Render("● FOLLOWING"))
+	} else {
+		parts = append(parts, lipgloss.NewStyle().
+			Foreground(m.theme.TabInactive).
+			Background(m.theme.ActionBarBackground).
+			Render("○ paused"))
+	}
+
+	// Search match info
+	if m.logSearchQuery != "" {
+		info := fmt.Sprintf(" /%s", m.logSearchQuery)
+		if len(m.logSearchMatches) > 0 {
+			info += fmt.Sprintf(" [%d/%d]", m.logSearchMatchIdx+1, len(m.logSearchMatches))
+		} else {
+			info += " [no matches]"
+		}
+		parts = append(parts, lipgloss.NewStyle().
+			Foreground(m.theme.Foreground).
+			Background(m.theme.ActionBarBackground).
+			Render(info))
+	}
+
+	// Line count
+	countStr := fmt.Sprintf("lines: %d", len(m.logLines))
+	parts = append(parts, lipgloss.NewStyle().
+		Foreground(m.theme.TabInactive).
+		Background(m.theme.ActionBarBackground).
+		Render(countStr))
+
+	return bg.Render(strings.Join(parts, " │ "))
+}
+
+// renderLogActionBar draws keybinding hints at the very bottom of
+// the log pane, matching the style of the navigator's action bar.
+func (m AppModel) renderLogActionBar(width int) string {
+	type hint struct{ key, label string }
+	hints := []hint{
+		{"F", "Follow"},
+		{"/", "Search"},
+		{"n", "Next"},
+		{"N", "Prev"},
+		{"jk", "Scroll"},
+		{"Esc", "Clear"},
+		{"q", "Quit"},
+	}
+
+	keyStyle := lipgloss.NewStyle().
+		Foreground(m.theme.ActionKey).
+		Bold(true).
+		Background(m.theme.ActionBarBackground)
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(m.theme.ActionLabel).
+		Background(m.theme.ActionBarBackground)
+
+	sep := lipgloss.NewStyle().
+		Foreground(m.theme.ActionSeparator).
+		Background(m.theme.ActionBarBackground).
+		Render("  ")
+
+	var parts []string
+	for _, h := range hints {
+		parts = append(parts, keyStyle.Render(h.key)+":"+labelStyle.Render(h.label))
+	}
+
+	bar := strings.Join(parts, sep)
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Background(m.theme.ActionBarBackground).
+		Padding(0, 1).
+		Render(bar)
 }
 
 // ── Network overview pane ────────────────────────────────────────
@@ -1467,6 +1733,153 @@ func fitStr(s string, w int) string {
 	return s + strings.Repeat(" ", w-len(runes))
 }
 
+// ── Follow-logs helpers ───────────────────────────────────────────
+
+// startFollowLogs begins streaming logs from Docker for the currently
+// selected container. Returns a tea.Cmd that starts the goroutine and
+// begins reading lines.
+func (m *AppModel) startFollowLogs() tea.Cmd {
+	if m.selectedName == "" {
+		return nil
+	}
+
+	// Stop any existing follow first.
+	m.stopFollowLogs()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.logCancel = cancel
+	m.followMode = true
+	m.logAutoScroll = true
+
+	ch := make(chan string, 256)
+	m.logLineCh = ch
+
+	// Launch the goroutine that reads from docker logs -f and feeds
+	// lines into the channel.
+	go func() {
+		defer close(ch)
+		dc := docker.NewClient()
+		stream := dc.FollowLogs(ctx, m.selectedName)
+		for line := range stream {
+			select {
+			case ch <- line:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return waitForLogLine(ch)
+}
+
+// stopFollowLogs cancels the running docker logs -f subprocess and
+// cleans up follow state.
+func (m *AppModel) stopFollowLogs() {
+	if m.logCancel != nil {
+		m.logCancel()
+		m.logCancel = nil
+	}
+	m.followMode = false
+	m.logLineCh = nil
+}
+
+// ── Log search helpers ────────────────────────────────────────────
+
+// doLogSearch rebuilds the list of log line indices that match the
+// current logSearchQuery. Resets the match position to 0.
+func (m *AppModel) doLogSearch() {
+	if m.logSearchQuery == "" {
+		m.logSearchMatches = nil
+		m.logSearchMatchIdx = 0
+		return
+	}
+
+	q := strings.ToLower(m.logSearchQuery)
+	m.logSearchMatches = nil
+	for i, line := range m.logLines {
+		if strings.Contains(strings.ToLower(line), q) {
+			m.logSearchMatches = append(m.logSearchMatches, i)
+		}
+	}
+	m.logSearchMatchIdx = 0
+
+	// Jump to first match
+	if len(m.logSearchMatches) > 0 {
+		m.logAutoScroll = false
+		m.logScrollOff = m.logSearchMatches[0]
+		clampLogScroll(m)
+	}
+}
+
+// rebuildLogSearchMatches rebuilds matches without resetting position.
+func (m *AppModel) rebuildLogSearchMatches() {
+	if m.logSearchQuery == "" {
+		return
+	}
+	q := strings.ToLower(m.logSearchQuery)
+	m.logSearchMatches = nil
+	for i, line := range m.logLines {
+		if strings.Contains(strings.ToLower(line), q) {
+			m.logSearchMatches = append(m.logSearchMatches, i)
+		}
+	}
+}
+
+// nextLogSearchMatch moves to the next search match.
+func (m *AppModel) nextLogSearchMatch() {
+	if len(m.logSearchMatches) == 0 {
+		return
+	}
+	m.logSearchMatchIdx++
+	if m.logSearchMatchIdx >= len(m.logSearchMatches) {
+		m.logSearchMatchIdx = 0
+	}
+	m.jumpToLogSearchMatch()
+}
+
+// prevLogSearchMatch moves to the previous search match.
+func (m *AppModel) prevLogSearchMatch() {
+	if len(m.logSearchMatches) == 0 {
+		return
+	}
+	m.logSearchMatchIdx--
+	if m.logSearchMatchIdx < 0 {
+		m.logSearchMatchIdx = len(m.logSearchMatches) - 1
+	}
+	m.jumpToLogSearchMatch()
+}
+
+// jumpToLogSearchMatch scrolls to make the current search match visible.
+func (m *AppModel) jumpToLogSearchMatch() {
+	if m.logSearchMatchIdx < 0 || m.logSearchMatchIdx >= len(m.logSearchMatches) {
+		return
+	}
+	m.logAutoScroll = false
+	m.logScrollOff = m.logSearchMatches[m.logSearchMatchIdx]
+	clampLogScroll(m)
+}
+
+// clearLogSearch clears the log search state.
+func (m *AppModel) clearLogSearch() {
+	m.logSearchQuery = ""
+	m.logSearchMatches = nil
+	m.logSearchMatchIdx = 0
+}
+
+// clampLogScroll ensures the log scroll offset is within valid bounds.
+func clampLogScroll(m *AppModel) {
+	if m.logScrollOff < 0 {
+		m.logScrollOff = 0
+	}
+	maxOff := len(m.logLines) - m.logViewHeight()
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.logScrollOff > maxOff {
+		m.logScrollOff = maxOff
+	}
+}
+
 // ── Commands ─────────────────────────────────────────────────────
 
 // logViewHeight returns the available height (in lines) for the
@@ -1485,6 +1898,18 @@ func fetchLogs(dc *docker.Client, containerName string) tea.Cmd {
 	return func() tea.Msg {
 		logs, err := dc.GetLogs(containerName)
 		return logsLoadedMsg{containerName: containerName, logs: logs, err: err}
+	}
+}
+
+// waitForLogLine reads the next line from the follow-logs channel.
+// When the channel is closed, sends a logStreamEndedMsg.
+func waitForLogLine(ch chan string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return logStreamEndedMsg{}
+		}
+		return logLineMsg{containerName: "", line: line}
 	}
 }
 

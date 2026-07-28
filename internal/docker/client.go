@@ -1,6 +1,8 @@
 package docker
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -194,6 +196,50 @@ func (c *Client) GetStartedTimes() (map[string]string, error) {
 // GetLogs returns the last 200 lines of logs for a container.
 func (c *Client) GetLogs(containerName string) (string, error) {
 	return runDockerCLI("logs", "--tail", "200", containerName)
+}
+
+// FollowLogs streams container logs in real-time (like docker logs -f).
+// It first emits the last 500 lines of history, then follows with new
+// lines. The caller cancels the context to stop streaming. The returned
+// channel is closed after the context is cancelled or the subprocess
+// exits.
+func (c *Client) FollowLogs(ctx context.Context, containerName string) <-chan string {
+	ch := make(chan string, 256)
+
+	go func() {
+		defer close(ch)
+
+		cmd := exec.CommandContext(ctx,
+			"docker", "logs", "-f", "--tail", "500", containerName)
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			return
+		}
+
+		scanner := bufio.NewScanner(stdout)
+		// Increase buffer for long log lines.
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+		for scanner.Scan() {
+			select {
+			case ch <- scanner.Text():
+			case <-ctx.Done():
+				// Drain the subprocess before returning.
+				cmd.Process.Kill()
+				return
+			}
+		}
+		_ = scanner.Err() // expected when context is cancelled
+
+		cmd.Wait()
+	}()
+
+	return ch
 }
 
 // ── Container actions ────────────────────────────────────────────
