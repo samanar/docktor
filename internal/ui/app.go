@@ -203,6 +203,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Show error briefly in the pane
 			m.pane.lastError = fmt.Sprintf("Failed to %s %s: %v", msg.action, msg.name, msg.err)
 		}
+		// Compose actions clear the loading spinner immediately.
+		if strings.HasPrefix(msg.action, "compose-") {
+			m.pane.ClearComposeLoading()
+		}
 		return m, m.pane.Init()
 
 	// ── Image layers arrived ─────────────────────────

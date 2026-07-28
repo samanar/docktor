@@ -52,8 +52,9 @@ type Container struct {
 // ContainerGroup is a named group of containers (a Compose project
 // or the "Other" catch-all).
 type ContainerGroup struct {
-	Project    string
-	Containers []Container
+	Project     string
+	ComposeFile string // path to docker-compose.yml (empty for "Other")
+	Containers  []Container
 }
 
 // Image represents a Docker image with the fields the TUI needs.
@@ -153,7 +154,18 @@ func (c *Client) ListContainers() ([]ContainerGroup, error) {
 		})
 	}
 
-	return groupByProject(containers), nil
+	groups := groupByProject(containers)
+
+	// Resolve compose file path for each group (except "Other").
+	for i := range groups {
+		if groups[i].Project == "Other" || len(groups[i].Containers) == 0 {
+			continue
+		}
+		// Get working_dir label from the first container in the group.
+		groups[i].ComposeFile = c.resolveComposeFile(groups[i].Containers[0].ID)
+	}
+
+	return groups, nil
 }
 
 // GetStartedTimes returns a map of container name → StartedAt
@@ -906,6 +918,62 @@ func extractComposeProject(labels string) string {
 		}
 	}
 	return ""
+}
+
+// resolveComposeFile inspects a container and returns the path to
+// its docker-compose.yml file, or empty string if not found.
+func (c *Client) resolveComposeFile(containerID string) string {
+	raw, err := runDockerCLI("inspect",
+		"--format", "{{range $k,$v := .Config.Labels}}{{$k}}={{$v}},{{end}}",
+		containerID)
+	if err != nil {
+		return ""
+	}
+	// Look for com.docker.compose.project.working_dir
+	for _, pair := range strings.Split(strings.TrimSpace(raw), ",") {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) == 2 && kv[0] == "com.docker.compose.project.working_dir" {
+			return kv[1] + "/docker-compose.yml"
+		}
+	}
+	return ""
+}
+
+// ── Compose actions ───────────────────────────────────────────────
+
+// ComposeUp runs docker-compose up -d in the project's directory.
+func (c *Client) ComposeUp(composeFile string) error {
+	dir := strings.TrimSuffix(composeFile, "/docker-compose.yml")
+	_, err := runDockerCLI("compose", "-f", composeFile, "--project-directory", dir, "up", "-d")
+	return err
+}
+
+// ComposeDown runs docker-compose down in the project's directory.
+func (c *Client) ComposeDown(composeFile string) error {
+	dir := strings.TrimSuffix(composeFile, "/docker-compose.yml")
+	_, err := runDockerCLI("compose", "-f", composeFile, "--project-directory", dir, "down")
+	return err
+}
+
+// ComposePull runs docker-compose pull in the project's directory.
+func (c *Client) ComposePull(composeFile string) error {
+	dir := strings.TrimSuffix(composeFile, "/docker-compose.yml")
+	_, err := runDockerCLI("compose", "-f", composeFile, "--project-directory", dir, "pull")
+	return err
+}
+
+// ComposeBuild runs docker-compose build in the project's directory.
+func (c *Client) ComposeBuild(composeFile string) error {
+	dir := strings.TrimSuffix(composeFile, "/docker-compose.yml")
+	_, err := runDockerCLI("compose", "-f", composeFile, "--project-directory", dir, "build")
+	return err
+}
+
+// ComposeRestart runs docker-compose restart in the project's directory.
+func (c *Client) ComposeRestart(composeFile string) error {
+	dir := strings.TrimSuffix(composeFile, "/docker-compose.yml")
+	_, err := runDockerCLI("compose", "-f", composeFile, "--project-directory", dir, "restart")
+	return err
 }
 
 // groupByProject buckets containers by Compose project. Any container

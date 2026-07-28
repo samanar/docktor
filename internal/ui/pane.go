@@ -181,6 +181,9 @@ type Pane struct {
 
 	// ── Error state ─────────────────────────────────
 	lastError string // non-empty when Docker is unreachable or an operation failed
+
+	// ── Compose loading ─────────────────────────────
+	composeLoadingID string // group ID of a compose action in progress
 }
 
 // ── Action sets per tab ──────────────────────────────────────────
@@ -203,6 +206,16 @@ var imageActions = []Action{
 var networkActions = []Action{
 	{Key: 'I', Label: "Inspect"},
 	{Key: 'P', Label: "Prune"},
+	{Key: '/', Label: "Filter"},
+	{Key: 'q', Label: "Quit"},
+}
+
+var composeActions = []Action{
+	{Key: 'u', Label: "Up"},
+	{Key: 'd', Label: "Down"},
+	{Key: 'p', Label: "Pull"},
+	{Key: 'b', Label: "Build"},
+	{Key: 'R', Label: "Restart"},
 	{Key: '/', Label: "Filter"},
 	{Key: 'q', Label: "Quit"},
 }
@@ -402,8 +415,11 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 	// ── Spinner animation ─────────────────────────────
 	case spinnerTickMsg:
-		if p.loading || p.volumesLoading {
+		if p.loading || p.volumesLoading || p.composeLoadingID != "" {
 			p.spinnerIdx = (p.spinnerIdx + 1) % len(spinnerFrames)
+			if p.composeLoadingID != "" && p.activeTab == 0 {
+				p.rebuildTableRows()
+			}
 			return p, spinnerTick()
 		}
 		return p, nil
@@ -544,6 +560,19 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 			case "e":
 				if p.activeTab == 0 {
 					return p, p.doExec()
+				}
+
+			// ── Compose actions (containers tab, group selected) ──
+			case "u", "d", "p", "b", "R":
+				if p.activeTab == 0 {
+					if cf := p.composeFileForSelectedGroup(); cf != "" {
+						p.composeLoadingID = p.table.GroupIDAt(p.table.HighlightedRow())
+						p.spinnerIdx = 0
+						return p, tea.Batch(
+							p.doComposeAction(string(msg.Runes), cf),
+							spinnerTick(),
+						)
+					}
 				}
 
 			// ── Network actions ────────────────────
@@ -696,8 +725,20 @@ func (p Pane) renderDivider(width int) string {
 }
 
 func (p Pane) renderActionBar(width int) string {
+	// Dynamically pick actions: compose actions when a compose group
+	// header is selected on the containers tab.
+	actions := p.actions
+	if p.activeTab == 0 {
+		sel := p.table.HighlightedRow()
+		if p.table.RowTypeAt(sel) == RowGroup {
+			if cf := p.composeFileForSelectedGroup(); cf != "" {
+				actions = composeActions
+			}
+		}
+	}
+
 	var parts []string
-	for _, a := range p.actions {
+	for _, a := range actions {
 		key := lipgloss.NewStyle().
 			Foreground(p.theme.ActionKey).
 			Bold(true).
@@ -810,6 +851,27 @@ func (p Pane) tabIndexByKey(key rune) int {
 		}
 	}
 	return p.activeTab
+}
+
+// composeFileForSelectedGroup returns the compose file path for the
+// currently selected group header, or "" if the selection is not on
+// a compose group or the group is "Other".
+func (p Pane) composeFileForSelectedGroup() string {
+	sel := p.table.HighlightedRow()
+	gid := p.table.GroupIDAt(sel)
+	for _, g := range p.groups {
+		if "group:"+g.Project == gid && g.ComposeFile != "" {
+			return g.ComposeFile
+		}
+	}
+	return ""
+}
+
+// ClearComposeLoading clears the compose loading state and rebuilds
+// the table rows so the spinner disappears immediately.
+func (p *Pane) ClearComposeLoading() {
+	p.composeLoadingID = ""
+	p.rebuildTableRows()
 }
 
 // switchTab changes the active tab and performs setup: swapping
@@ -1096,6 +1158,37 @@ func (p Pane) doExec() tea.Cmd {
 	)
 }
 
+// doComposeAction returns a tea.Cmd that executes a docker-compose
+// action on the specified compose file.
+func (p Pane) doComposeAction(key string, composeFile string) tea.Cmd {
+	var action string
+	var fn func(string) error
+	switch key {
+	case "u":
+		action = "up"
+		fn = p.dockerClient.ComposeUp
+	case "d":
+		action = "down"
+		fn = p.dockerClient.ComposeDown
+	case "p":
+		action = "pull"
+		fn = p.dockerClient.ComposePull
+	case "b":
+		action = "build"
+		fn = p.dockerClient.ComposeBuild
+	case "R":
+		action = "restart"
+		fn = p.dockerClient.ComposeRestart
+	default:
+		return nil
+	}
+
+	return func() tea.Msg {
+		err := fn(composeFile)
+		return actionExecutedMsg{action: "compose-" + action, name: composeFile, err: err}
+	}
+}
+
 // ── Search ────────────────────────────────────────────────────────
 
 // doSearch finds all rows whose container name contains the current
@@ -1290,7 +1383,7 @@ func volumeColumns() []ColumnDef {
 // buildTableRows converts Docker container groups into table Rows
 // with status dots, Docker-style coloring, collapsible groups, and
 // visual separators between groups.
-func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[string]bool) []Row {
+func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[string]bool, composeLoadingID string, spinnerIdx int) []Row {
 	// ── Pre-compute styles ────────────────────────────
 	projectStyle := lipgloss.NewStyle().
 		Foreground(theme.TabActive).
@@ -1332,6 +1425,10 @@ func buildTableRows(theme Theme, groups []docker.ContainerGroup, collapsed map[s
 		toggle := "▸"
 		if collapsed[groupID] {
 			toggle = "▻"
+		}
+		// Show spinner when a compose action is running on this group.
+		if composeLoadingID == groupID {
+			toggle = spinnerFrames[spinnerIdx%len(spinnerFrames)]
 		}
 		title := fmt.Sprintf("%s %s (%d)", toggle, label, count)
 
@@ -1550,7 +1647,7 @@ func (p *Pane) rebuildTableRows() {
 	} else if p.ActiveTabKey() == 'i' {
 		rows = buildImageRows(p.theme, p.images)
 	} else {
-		rows = buildTableRows(p.theme, p.groups, p.collapsedGroups)
+		rows = buildTableRows(p.theme, p.groups, p.collapsedGroups, p.composeLoadingID, p.spinnerIdx)
 	}
 	p.table = p.table.WithRows(rows)
 	if len(rows) > 0 && p.table.HighlightedRow() < 0 {
