@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -9,7 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/samanar/lazycompose/internal/docker"
+	"github.com/samanar/docktor/internal/docker"
 )
 
 // ── Column keys ──────────────────────────────────────────────────
@@ -150,7 +151,7 @@ type Pane struct {
 	// ── Loading & Docker ─────────────────────────────
 	loading      bool
 	spinnerIdx   int
-	dockerClient *docker.Client
+	dockerClient docker.Client
 
 	// ── Raw grouped container data ───────────────────
 	groups []docker.ContainerGroup
@@ -222,7 +223,7 @@ var composeActions = []Action{
 
 // NewPane creates a new navigator pane with default tabs, actions,
 // and a Docker client for live container data.
-func NewPane(theme Theme, dc *docker.Client) Pane {
+func NewPane(theme Theme, dc docker.Client) Pane {
 	tabs := []Tab{
 		{Key: 'c', Label: "Containers"},
 		{Key: 'i', Label: "Images"},
@@ -1127,10 +1128,11 @@ func (p Pane) GetSelectedNetwork() *docker.Network {
 // doNetworkAction returns a tea.Cmd that executes a network-level
 // action. Returns nil if the action is not applicable.
 func (p Pane) doNetworkAction(action string) tea.Cmd {
+	ctx := context.Background()
 	switch action {
 	case "prune":
 		return func() tea.Msg {
-			_, err := p.dockerClient.PruneNetworks()
+			_, err := p.dockerClient.PruneNetworks(ctx)
 			return networkActionExecutedMsg{action: "prune", err: err}
 		}
 	case "inspect":
@@ -1139,7 +1141,7 @@ func (p Pane) doNetworkAction(action string) tea.Cmd {
 			return nil
 		}
 		return func() tea.Msg {
-			raw, err := p.dockerClient.InspectNetworkRaw(name)
+			raw, err := p.dockerClient.InspectNetworkRaw(ctx, name)
 			return networkInspectLoadedMsg{name: name, json: raw, err: err}
 		}
 	}
@@ -1149,13 +1151,13 @@ func (p Pane) doNetworkAction(action string) tea.Cmd {
 // doAction returns a tea.Cmd that executes the given action function
 // on the currently selected container.  Returns nil if no container
 // is selected.
-func (p Pane) doAction(action string, fn func(string) error) tea.Cmd {
+func (p Pane) doAction(action string, fn func(context.Context, string) error) tea.Cmd {
 	name := p.SelectedContainer()
 	if name == "" {
 		return nil
 	}
 	return func() tea.Msg {
-		err := fn(name)
+		err := fn(context.Background(), name)
 		return actionExecutedMsg{action: action, name: name, err: err}
 	}
 }
@@ -1182,29 +1184,36 @@ func (p Pane) doExec() tea.Cmd {
 // action on the specified compose file.
 func (p Pane) doComposeAction(key string, composeFile string) tea.Cmd {
 	var action string
-	var fn func(string) error
 	switch key {
 	case "u":
 		action = "up"
-		fn = p.dockerClient.ComposeUp
 	case "d":
 		action = "down"
-		fn = p.dockerClient.ComposeDown
 	case "p":
 		action = "pull"
-		fn = p.dockerClient.ComposePull
 	case "b":
 		action = "build"
-		fn = p.dockerClient.ComposeBuild
 	case "R":
 		action = "restart"
-		fn = p.dockerClient.ComposeRestart
 	default:
 		return nil
 	}
 
 	return func() tea.Msg {
-		err := fn(composeFile)
+		var err error
+		ctx := context.Background()
+		switch key {
+		case "u":
+			err = p.dockerClient.ComposeUp(ctx, composeFile)
+		case "d":
+			err = p.dockerClient.ComposeDown(ctx, composeFile)
+		case "p":
+			err = p.dockerClient.ComposePull(ctx, composeFile)
+		case "b":
+			err = p.dockerClient.ComposeBuild(ctx, composeFile)
+		case "R":
+			err = p.dockerClient.ComposeRestart(ctx, composeFile)
+		}
 		return actionExecutedMsg{action: "compose-" + action, name: composeFile, err: err}
 	}
 }
@@ -2059,11 +2068,12 @@ func padLines(s string, targetWidth, pad int) string {
 
 // fetchContainers returns a command that asynchronously fetches
 // Docker containers and groups them by Compose project.
-func fetchContainers(dc *docker.Client) tea.Cmd {
+func fetchContainers(dc docker.Client) tea.Cmd {
 	return func() tea.Msg {
-		groups, err := dc.ListContainers()
+		ctx := context.Background()
+		groups, err := dc.ListContainers(ctx)
 		if err == nil {
-			started, _ := dc.GetStartedTimes()
+			started, _ := dc.GetStartedTimes(ctx)
 			mergeStarted(groups, started)
 		}
 		return containersLoadedMsg{groups: groups, err: err}
@@ -2072,18 +2082,18 @@ func fetchContainers(dc *docker.Client) tea.Cmd {
 
 // fetchImages returns a command that asynchronously fetches Docker
 // images.
-func fetchImages(dc *docker.Client) tea.Cmd {
+func fetchImages(dc docker.Client) tea.Cmd {
 	return func() tea.Msg {
-		images, err := dc.ListImages()
+		images, err := dc.ListImages(context.Background())
 		return imagesLoadedMsg{images: images, err: err}
 	}
 }
 
 // fetchNetworks returns a command that asynchronously fetches
 // Docker networks and groups them by driver.
-func fetchNetworks(dc *docker.Client) tea.Cmd {
+func fetchNetworks(dc docker.Client) tea.Cmd {
 	return func() tea.Msg {
-		groups, err := dc.ListNetworks()
+		groups, err := dc.ListNetworks(context.Background())
 		return networksLoadedMsg{groups: groups, err: err}
 	}
 }
@@ -2117,18 +2127,18 @@ func statsTick() tea.Cmd {
 
 // fetchStats returns a command that asynchronously fetches live
 // container resource stats from the Docker daemon.
-func fetchStats(dc *docker.Client) tea.Cmd {
+func fetchStats(dc docker.Client) tea.Cmd {
 	return func() tea.Msg {
-		stats, err := dc.GetStats()
+		stats, err := dc.GetStats(context.Background())
 		return statsRefreshMsg{stats: stats, err: err}
 	}
 }
 
 // fetchVolumes returns a command that asynchronously fetches Docker
 // volumes with their driver, mountpoint, and size information.
-func fetchVolumes(dc *docker.Client) tea.Cmd {
+func fetchVolumes(dc docker.Client) tea.Cmd {
 	return func() tea.Msg {
-		volumes, err := dc.GetVolumes()
+		volumes, err := dc.GetVolumes(context.Background())
 		return volumesLoadedMsg{volumes: volumes, err: err}
 	}
 }

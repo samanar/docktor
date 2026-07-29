@@ -9,7 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/samanar/lazycompose/internal/docker"
+	"github.com/samanar/docktor/internal/docker"
 )
 
 // AppModel is the root Bubble Tea model for the docktor application.
@@ -17,7 +17,7 @@ import (
 type AppModel struct {
 	theme Theme
 	pane  Pane
-	dc    *docker.Client
+	dc    docker.Client
 
 	width  int
 	height int
@@ -70,15 +70,18 @@ type AppModel struct {
 }
 
 // NewApp creates the root application model with the given theme.
-func NewApp(theme Theme) AppModel {
-	dc := docker.NewClient()
+func NewApp(theme Theme) (AppModel, error) {
+	dc, err := docker.NewClient()
+	if err != nil {
+		return AppModel{}, fmt.Errorf("docker client: %w", err)
+	}
 	return AppModel{
 		theme:         theme,
 		pane:          NewPane(theme, dc),
 		dc:            dc,
 		focus:         1,
 		logAutoScroll: true,
-	}
+	}, nil
 }
 
 // ── Custom messages ──────────────────────────────────────────────
@@ -342,16 +345,6 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Enter on a data row (not a group header) should
 			// move focus to the logs / detail pane.
 			isEnter := msg.Type == tea.KeyEnter
-
-			prevContainer := m.selectedName
-			prevNetwork := m.selectedNetworkName
-			prevImgID := m.selectedImageID
-			prevVol := m.selectedVolume
-			var cmd tea.Cmd
-			m.pane, cmd = m.pane.Update(msg)
-
-			// Enter on a container / image / volume / network row
-			// switches focus to the bottom detail pane.
 			if isEnter {
 				if m.pane.SelectedContainer() != "" ||
 					m.pane.SelectedImage() != "" ||
@@ -359,73 +352,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pane.SelectedNetwork() != "" {
 					m.focus = 3
 					m.pane.focused = false
+					_, cmd := m.pane.Update(msg)
 					return m, cmd
 				}
 			}
 
-			// Check for container selection change
-			newContainer := m.pane.SelectedContainer()
-			if newContainer != "" && newContainer != prevContainer {
-				m.stopFollowLogs()
-				m.clearLogSearch()
-				m.selectedName = newContainer
-				m.selectedNetworkName = ""
-				m.selectedImageID = ""
-				m.imageLayers = nil
-				m.selectedVolume = ""
-				m.selectedVolumeObj = nil
-				m.volumeFileUsage = nil
-				m.logAutoScroll = true
-				return m, tea.Batch(cmd,
-					fetchLogs(m.dc, newContainer),
-					fetchDiskUsage(m.dc, newContainer),
-				)
-			}
-
-			// Check for network selection change
-			newNetwork := m.pane.SelectedNetwork()
-			if newNetwork != "" && newNetwork != prevNetwork {
-				m.selectedNetworkName = newNetwork
-				m.selectedName = ""
-				m.networkDetailAutoScroll = true
-				return m, tea.Batch(cmd,
-					fetchNetworkInspect(m.dc, newNetwork),
-				)
-			}
-
-			// Check image selection
-			newImgID := m.pane.SelectedImage()
-			if newImgID != "" && newImgID != prevImgID {
-				m.selectedImageID = newImgID
-				m.selectedName = ""
-				m.selectedNetworkName = ""
-				m.selectedVolume = ""
-				m.selectedVolumeObj = nil
-				m.logLines = nil
-				m.logAutoScroll = true
-				return m, tea.Batch(cmd,
-					fetchImageHistory(m.dc, newImgID),
-				)
-			}
-
-			// Check for volume selection change
-			newVol := m.pane.SelectedVolume()
-			if newVol != "" && newVol != prevVol {
-				m.selectedVolume = newVol
-				m.selectedName = ""
-				m.selectedImageID = ""
-				m.selectedNetworkName = ""
-				m.imageLayers = nil
-				m.logAutoScroll = true
-				m.logLines = nil
-				m.volumeUsageErr = nil
-				m.selectedVolumeObj = m.pane.FindVolume(newVol)
-				return m, tea.Batch(cmd,
-					fetchVolumeUsage(m.dc, newVol),
-				)
-			}
-
-			return m, cmd
+			return m.handleSelectionChanges(m.pane.Update(msg))
 		}
 
 		// ── Log / detail scrolling (focus 3) ───────────
@@ -531,13 +463,23 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	return m.handleSelectionChanges(m.pane.Update(msg))
+}
+
+// handleSelectionChanges detects which entity (container, network,
+// image, or volume) is selected and dispatches the appropriate
+// async data-fetch commands.  This is called from both the focus=1
+// KeyMsg handler and the catch-all message path to avoid duplication.
+func (m AppModel) handleSelectionChanges(pane Pane, cmd tea.Cmd) (AppModel, tea.Cmd) {
+	m.pane = pane
+
+	// Snapshot current selection state so we can detect changes.
 	prevContainer := m.selectedName
 	prevNetwork := m.selectedNetworkName
 	prevImgID := m.selectedImageID
 	prevVol := m.selectedVolume
-	var cmd tea.Cmd
-	m.pane, cmd = m.pane.Update(msg)
 
+	// ── Container selection ─────────────────────────
 	newContainer := m.pane.SelectedContainer()
 	if newContainer != "" && newContainer != prevContainer {
 		m.stopFollowLogs()
@@ -556,6 +498,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 	}
 
+	// ── Network selection ───────────────────────────
 	newNetwork := m.pane.SelectedNetwork()
 	if newNetwork != "" && newNetwork != prevNetwork {
 		m.selectedNetworkName = newNetwork
@@ -566,10 +509,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 	}
 
+	// ── Image selection ─────────────────────────────
 	newImgID := m.pane.SelectedImage()
 	if newImgID != "" && newImgID != prevImgID {
 		m.selectedImageID = newImgID
 		m.selectedName = ""
+		m.selectedNetworkName = ""
+		m.selectedVolume = ""
+		m.selectedVolumeObj = nil
 		m.logLines = nil
 		m.logAutoScroll = true
 		return m, tea.Batch(cmd,
@@ -577,11 +524,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 	}
 
-	// Check for volume selection change
+	// ── Volume selection ────────────────────────────
 	newVol := m.pane.SelectedVolume()
 	if newVol != "" && newVol != prevVol {
 		m.selectedVolume = newVol
 		m.selectedName = ""
+		m.selectedImageID = ""
+		m.selectedNetworkName = ""
+		m.imageLayers = nil
 		m.logAutoScroll = true
 		m.logLines = nil
 		m.volumeUsageErr = nil
@@ -1118,11 +1068,11 @@ func ansiDrop(s string, n int) string {
 // actions dialog.
 var bulkActions = []struct {
 	label  string
-	action func(*docker.Client) (string, error)
+	action func(docker.Client) (string, error)
 }{
-	{"Stop All Containers", func(dc *docker.Client) (string, error) { return dc.StopAllContainers() }},
-	{"Remove All Containers", func(dc *docker.Client) (string, error) { return dc.RemoveAllContainers() }},
-	{"Prune Exited Containers", func(dc *docker.Client) (string, error) { return dc.PruneContainers() }},
+	{"Stop All Containers", func(dc docker.Client) (string, error) { return dc.StopAllContainers(context.Background()) }},
+	{"Remove All Containers", func(dc docker.Client) (string, error) { return dc.RemoveAllContainers(context.Background()) }},
+	{"Prune Exited Containers", func(dc docker.Client) (string, error) { return dc.PruneContainers(context.Background()) }},
 }
 
 // executeBulkAction runs the selected bulk action asynchronously
@@ -2290,8 +2240,10 @@ func (m *AppModel) startFollowLogs() tea.Cmd {
 	// lines into the channel.
 	go func() {
 		defer close(ch)
-		dc := docker.NewClient()
-		stream := dc.FollowLogs(ctx, m.selectedName)
+		stream, err := m.dc.FollowLogs(ctx, m.selectedName)
+		if err != nil {
+			return
+		}
 		for line := range stream {
 			select {
 			case ch <- line:
@@ -2426,9 +2378,9 @@ func (m AppModel) logViewHeight() int {
 
 // fetchLogs returns a command that fetches the last 200 lines of
 // logs for the given container.
-func fetchLogs(dc *docker.Client, containerName string) tea.Cmd {
+func fetchLogs(dc docker.Client, containerName string) tea.Cmd {
 	return func() tea.Msg {
-		logs, err := dc.GetLogs(containerName)
+		logs, err := dc.GetLogs(context.Background(), containerName)
 		return logsLoadedMsg{containerName: containerName, logs: logs, err: err}
 	}
 }
@@ -2447,9 +2399,9 @@ func waitForLogLine(ch chan string) tea.Cmd {
 
 // fetchDiskUsage returns a command that fetches the total disk usage
 // (writable layer + mounted volumes) of the given container.
-func fetchDiskUsage(dc *docker.Client, containerName string) tea.Cmd {
+func fetchDiskUsage(dc docker.Client, containerName string) tea.Cmd {
 	return func() tea.Msg {
-		size, err := dc.GetContainerDiskUsage(containerName)
+		size, err := dc.GetContainerDiskUsage(context.Background(), containerName)
 		if err != nil {
 			return imageSizeLoadedMsg{containerName: containerName, imageSize: "—"}
 		}
@@ -2459,27 +2411,27 @@ func fetchDiskUsage(dc *docker.Client, containerName string) tea.Cmd {
 
 // fetchImageHistory returns a command that fetches the layer history
 // for the given image.
-func fetchImageHistory(dc *docker.Client, imageID string) tea.Cmd {
+func fetchImageHistory(dc docker.Client, imageID string) tea.Cmd {
 	return func() tea.Msg {
-		layers, err := dc.GetImageHistory(imageID)
+		layers, err := dc.GetImageHistory(context.Background(), imageID)
 		return imageLayersLoadedMsg{imageID: imageID, layers: layers, err: err}
 	}
 }
 
 // fetchNetworkInspect returns a command that fetches the raw JSON
 // output of `docker network inspect` for the given network.
-func fetchNetworkInspect(dc *docker.Client, name string) tea.Cmd {
+func fetchNetworkInspect(dc docker.Client, name string) tea.Cmd {
 	return func() tea.Msg {
-		raw, err := dc.InspectNetworkRaw(name)
+		raw, err := dc.InspectNetworkRaw(context.Background(), name)
 		return networkInspectLoadedMsg{name: name, json: raw, err: err}
 	}
 }
 
 // fetchVolumeUsage returns a command that fetches the per-file/folder
 // disk usage inside a Docker volume.
-func fetchVolumeUsage(dc *docker.Client, volumeName string) tea.Cmd {
+func fetchVolumeUsage(dc docker.Client, volumeName string) tea.Cmd {
 	return func() tea.Msg {
-		entries, err := dc.GetVolumeFileUsage(volumeName)
+		entries, err := dc.GetVolumeFileUsage(context.Background(), volumeName)
 		return volumeUsageLoadedMsg{volumeName: volumeName, entries: entries, err: err}
 	}
 }

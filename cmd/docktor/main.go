@@ -6,12 +6,16 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/samanar/lazycompose/internal/ui"
+	"github.com/samanar/docktor/internal/ui"
 )
 
 func main() {
 	theme := ui.DefaultTheme()
-	app := ui.NewApp(theme)
+	app, err := ui.NewApp(theme)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "docktor: %v\n", err)
+		os.Exit(1)
+	}
 
 	p := tea.NewProgram(app, tea.WithAltScreen())
 
