@@ -207,11 +207,6 @@ func formatNetIO(raw string) string {
 	return "↑" + tx + " ↓" + rx
 }
 
-// formatDiskIO returns the raw BlockIO value as-is (e.g. "3.4GB / 1.2GB").
-func formatDiskIO(raw string) string {
-	return raw
-}
-
 // splitIO splits a "valueA / valueB" string into its two parts.
 func splitIO(raw string) (string, string) {
 	if idx := strings.Index(raw, " / "); idx >= 0 {

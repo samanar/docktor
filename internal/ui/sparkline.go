@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -243,17 +242,4 @@ func (m *AppModel) recordSparklineHistory(
 		}
 		gMem.push(groupMemTotal)
 	}
-}
-
-// sparklineLabel returns a short label for display next to a sparkline.
-func sparklineLabel(metric string, h *sparklineHistory, unit string) string {
-	if h == nil || h.count == 0 {
-		return fmt.Sprintf("%s: —", metric)
-	}
-	vals := h.slices()
-	if len(vals) == 0 {
-		return fmt.Sprintf("%s: —", metric)
-	}
-	current := vals[len(vals)-1]
-	return fmt.Sprintf("%s: %.1f%s", metric, current, unit)
 }
