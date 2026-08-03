@@ -428,6 +428,61 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		// Dimensions are set by AppModel before passing the message.
 		p.recalcTable()
 
+	// ── Mouse ────────────────────────────────────────
+	case tea.MouseMsg:
+		if msg.Action != tea.MouseActionPress {
+			return p, nil
+		}
+
+		// Wheel scrolling — scroll the table viewport.
+		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			if p.loading || p.volumesLoading || p.searchMode {
+				return p, nil
+			}
+			delta := 3
+			if msg.Button == tea.MouseButtonWheelUp {
+				delta = -3
+			}
+			p.table.ScrollView(delta)
+			return p, nil
+		}
+
+		// Only handle left clicks for row selection.
+		if msg.Button != tea.MouseButtonLeft {
+			return p, nil
+		}
+		// Only interact with the table when not loading and not
+		// in search mode.
+		if p.loading || p.volumesLoading || p.searchMode {
+			return p, nil
+		}
+
+		// Convert absolute mouse coordinates to inner pane
+		// coordinates (minus 1-char border).
+		innerX := msg.X - 1
+		innerY := msg.Y - 1
+		if innerX < 0 || innerY < 0 {
+			return p, nil
+		}
+
+		// Calculate the Y offset where the table starts within
+		// the pane.  Chrome above the table:
+		//   tabBar(1) + tabDivider(1) [+ actionBar(1) +
+		//   actionDivider(1) when focused].
+		chromeY := 2
+		if p.focused {
+			chromeY += 2
+		}
+		// tableY is the Y position relative to the table's
+		// top-left corner (0 = header, 1 = divider, 2+ = rows).
+		tableY := innerY - chromeY
+		if tableY < 0 {
+			return p, nil
+		}
+
+		p.table.ClickAt(tableY)
+		return p, nil
+
 	case tea.KeyMsg:
 		if !p.focused {
 			return p, nil

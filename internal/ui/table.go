@@ -299,11 +299,75 @@ func (t *Table) SelectFirst() {
 	}
 }
 
+// ClickAt selects the row at the given Y position within the table
+// viewport.  Y=0 is the header line, Y=1 is the divider, Y>=2 are
+// data rows.  Returns true if a selectable row was clicked.
+func (t *Table) ClickAt(y int) bool {
+	// Header and divider are not clickable.
+	dataY := y - 2
+	if dataY < 0 {
+		return false
+	}
+
+	absIdx := t.yOffset + dataY
+	if absIdx < 0 || absIdx >= len(t.rows) {
+		return false
+	}
+
+	// Separator rows are not selectable — find the nearest data row.
+	if t.rows[absIdx].Type == RowSeparator {
+		// Try the row below first.
+		for i := absIdx + 1; i < len(t.rows); i++ {
+			if t.rows[i].Type != RowSeparator {
+				absIdx = i
+				break
+			}
+		}
+		// If no row below, try above.
+		if absIdx >= 0 && absIdx < len(t.rows) && t.rows[absIdx].Type == RowSeparator {
+			for i := absIdx - 1; i >= 0; i-- {
+				if t.rows[i].Type != RowSeparator {
+					absIdx = i
+					break
+				}
+			}
+		}
+		// Still a separator? Give up.
+		if absIdx >= 0 && absIdx < len(t.rows) && t.rows[absIdx].Type == RowSeparator {
+			return false
+		}
+	}
+
+	t.selected = absIdx
+	return true
+}
+
 // EnsureVisible scrolls to make the selected row visible.
 // Call this explicitly when you need to guarantee the scroll position
 // is correct (e.g., after data updates).
 func (t *Table) EnsureVisible() {
 	t.scrollToVisible()
+}
+
+// ScrollView shifts the visible viewport by delta rows without
+// changing the selected row.  Positive delta scrolls down (later
+// rows), negative scrolls up (earlier rows).  This is meant for
+// mouse wheel events.
+func (t *Table) ScrollView(delta int) {
+	if len(t.rows) == 0 || t.height < 1 {
+		return
+	}
+	maxOffset := len(t.rows) - t.height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	t.yOffset += delta
+	if t.yOffset < 0 {
+		t.yOffset = 0
+	}
+	if t.yOffset > maxOffset {
+		t.yOffset = maxOffset
+	}
 }
 
 // HighlightedRow returns the index of the selected row, or -1.

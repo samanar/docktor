@@ -278,6 +278,83 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh containers after bulk action
 		return m, m.pane.Init()
 
+	// ── Mouse ────────────────────────────────────────
+	case tea.MouseMsg:
+		if msg.Action != tea.MouseActionPress {
+			return m, nil
+		}
+
+		paneW := int(float64(m.width) * 0.70)
+		paneH := m.height / 3
+		if paneH < 5 {
+			paneH = 5
+		}
+
+		inLeft := msg.X < paneW
+		inTop := msg.Y < paneH
+
+		// ── Wheel events ───────────────────────────
+		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			if inLeft && inTop {
+				// Wheel in navigator pane → scroll table.
+				newPane, cmd := m.pane.Update(msg)
+				m.pane = newPane
+				return m, cmd
+			} else if m.focus == 3 {
+				// Wheel in log / detail pane → scroll content.
+				delta := 1
+				if msg.Button == tea.MouseButtonWheelUp {
+					delta = -1
+				}
+				for i := 0; i < 3; i++ {
+					if m.pane.ActiveTabKey() == 'N' {
+						if delta > 0 {
+							m.scrollNetworkDetailDown()
+						} else {
+							m.scrollNetworkDetailUp()
+						}
+					} else {
+						if delta > 0 {
+							m.scrollLogsDown()
+						} else {
+							m.scrollLogsUp()
+						}
+					}
+				}
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// ── Left-click events ──────────────────────
+		if msg.Button != tea.MouseButtonLeft {
+			return m, nil
+		}
+
+		if inLeft && inTop {
+			// Clicked on the navigator pane.  Pass the
+			// mouse event to the pane FIRST so it can
+			// calculate row selection using the pane's
+			// CURRENT chrome layout (focused or not).
+			// Then set focus and propagate the selection
+			// change.
+			newPane, cmd := m.pane.Update(msg)
+			m.pane = newPane
+			m.focus = 1
+			m.pane.focused = true
+			return m.handleSelectionChanges(m.pane, cmd)
+		} else if !inLeft && inTop {
+			// Clicked on the overview pane.
+			m.focus = 2
+			m.pane.focused = false
+			return m, nil
+		} else {
+			// Clicked on the logs / detail pane.
+			m.focus = 3
+			m.pane.focused = false
+			return m, nil
+		}
+
 	// ── Keyboard ─────────────────────────────────────
 	case tea.KeyMsg:
 		// ── Bulk dialog navigation (takes priority) ──
