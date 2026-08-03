@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+
 	"github.com/charmbracelet/lipgloss"
 	"github.com/samanar/docktor/internal/docker"
 )
@@ -383,7 +384,7 @@ func (m AppModel) renderOverview(width, height int, ctr *docker.Container) strin
 	b.WriteString(titleStyle.Render(shortenName(ctr.Name)))
 	b.WriteString("\n")
 	b.WriteString(divider)
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
 	// Fields
 	b.WriteString(row("ID:", truncateStr(ctr.ID, 16)))
@@ -402,18 +403,35 @@ func (m AppModel) renderOverview(width, height int, ctr *docker.Container) strin
 
 	b.WriteString("\n")
 	b.WriteString(divider)
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
-	// Resource usage
-	b.WriteString(titleStyle.Render("Resources"))
-	b.WriteString("\n")
-	b.WriteString(divider)
-	b.WriteString("\n\n")
+	// CPU + inline sparkline
+	sparkW := 14
+	if width-30 < sparkW {
+		sparkW = width - 30
+	}
+	if sparkW < 6 {
+		sparkW = 6
+	}
+	valW := width - 16 - sparkW
+	if valW < 4 {
+		valW = 4
+	}
+	cpuSpark := renderSparkline(m.cpuHistory[ctr.Name], sparkW, m.theme.StatusRunning)
+	b.WriteString(fmt.Sprintf("%s%-*s  %s\n",
+		labelStyle.Render("CPU:"),
+		valW, ctr.CPU,
+		cpuSpark,
+	))
 
-	b.WriteString(row("CPU:", ctr.CPU))
-	b.WriteString("\n")
-	b.WriteString(row("Memory:", ctr.Memory))
-	b.WriteString("\n")
+	// Memory + inline sparkline
+	memSpark := renderSparkline(m.memHistory[ctr.Name], sparkW, m.theme.TabHighlight)
+	b.WriteString(fmt.Sprintf("%s%-*s  %s\n",
+		labelStyle.Render("Memory:"),
+		valW, ctr.Memory,
+		memSpark,
+	))
+
 	if ctr.NetIO != "" && ctr.NetIO != "0B / 0B" {
 		b.WriteString(row("Network:", formatNetIO(ctr.NetIO)))
 		b.WriteString("\n")
@@ -427,11 +445,11 @@ func (m AppModel) renderOverview(width, height int, ctr *docker.Container) strin
 	if ctr.CreatedAt != "" || ctr.StartedAt != "" {
 		b.WriteString("\n")
 		b.WriteString(divider)
-		b.WriteString("\n\n")
+		b.WriteString("\n")
 		b.WriteString(titleStyle.Render("Timestamps"))
 		b.WriteString("\n")
 		b.WriteString(divider)
-		b.WriteString("\n\n")
+		b.WriteString("\n")
 	}
 
 	if ctr.CreatedAt != "" {
@@ -557,18 +575,40 @@ func (m AppModel) renderGroupOverview(width, height int, grp *docker.ContainerGr
 		totalMemUsed += used
 	}
 	if totalCPU > 0 || totalMemUsed > 0 {
-		b.WriteString(titleStyle.Render("Resources"))
-		b.WriteString("\n")
-		b.WriteString(divider)
-		b.WriteString("\n\n")
-		b.WriteString(row("CPU:", fmt.Sprintf("%.1f%% total", totalCPU)))
-		b.WriteString("\n")
-		b.WriteString(row("Memory:", formatBytes(totalMemUsed)))
-		b.WriteString("\n")
-		b.WriteString("\n")
-		b.WriteString(divider)
-		b.WriteString("\n\n")
+		gid := grp.Project
+		if gid == "" {
+			gid = "Other"
+		}
+		sparkW := 14
+		if width-26 < sparkW {
+			sparkW = width - 26
+		}
+		if sparkW < 6 {
+			sparkW = 6
+		}
+		valW := width - 14 - sparkW
+		if valW < 4 {
+			valW = 4
+		}
+
+		gCPUSpark := renderSparkline(m.groupCPUHistory[gid], sparkW, m.theme.StatusRunning)
+		b.WriteString(fmt.Sprintf("%s%-*s  %s\n",
+			labelStyle.Render("CPU:"),
+			valW, fmt.Sprintf("%.1f%% total", totalCPU),
+			gCPUSpark,
+		))
+
+		gMemSpark := renderSparkline(m.groupMemHistory[gid], sparkW, m.theme.TabHighlight)
+		b.WriteString(fmt.Sprintf("%s%-*s  %s\n",
+			labelStyle.Render("Memory:"),
+			valW, formatBytes(totalMemUsed),
+			gMemSpark,
+		))
 	}
+
+	b.WriteString("\n")
+	b.WriteString(divider)
+	b.WriteString("\n")
 
 	// ── Container list ───────────────────────────────
 	b.WriteString(titleStyle.Render("Containers"))

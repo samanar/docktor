@@ -821,10 +821,11 @@ func statsTick() tea.Cmd {
 }
 
 // fetchStats returns a command that asynchronously fetches live
-// container resource stats from the Docker daemon.
-func fetchStats(dc docker.Client) tea.Cmd {
+// container resource stats from the Docker daemon for the given
+// container names (only running containers should be passed).
+func fetchStats(dc docker.Client, names []string) tea.Cmd {
 	return func() tea.Msg {
-		stats, err := dc.GetStats(context.Background())
+		stats, err := dc.GetStats(context.Background(), names)
 		return statsRefreshMsg{stats: stats, err: err}
 	}
 }

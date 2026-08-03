@@ -391,7 +391,7 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 		if p.ActiveTabKey() != 'c' {
 			return p, nil
 		}
-		return p, fetchStats(p.dockerClient)
+		return p, fetchStats(p.dockerClient, p.runningContainerNames())
 
 	case statsRefreshMsg:
 		if p.ActiveTabKey() != 'c' {
@@ -498,31 +498,45 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 
 			case tea.KeyEnter:
 				p.searchMode = false
-				p.doSearch()
 				return p, nil
 
 			case tea.KeyBackspace:
 				if len(p.searchQuery) > 0 {
 					p.searchQuery = p.searchQuery[:len(p.searchQuery)-1]
 				}
+				p.doSearch()
 				return p, nil
 
 			case tea.KeyRunes:
 				p.searchQuery += string(msg.Runes)
+				p.doSearch()
 				return p, nil
 			}
 			return p, nil
 		}
 
 		// ── Not in search mode ─────────────────────────
-		// Block navigation while loading
-		if p.loading || p.volumesLoading {
-			return p, nil
-		}
-
 		// Reset gg detection on any non-g key
 		if msg.Type != tea.KeyRunes || string(msg.Runes) != "g" {
 			p.pendingG = false
+		}
+
+		// Search activation — allow even during loading so
+		// the search bar appears immediately.
+		if msg.Type == tea.KeyRunes && string(msg.Runes) == "/" {
+			p.searchMode = true
+			p.searchQuery = ""
+			return p, nil
+		}
+		if msg.Type == tea.KeyRunes && string(msg.Runes) == "n" {
+			p.nextSearchMatch()
+			return p, nil
+		}
+
+		// Block navigation while loading (but search is
+		// already handled above).
+		if p.loading || p.volumesLoading {
+			return p, nil
 		}
 
 		// ── Arrow keys + vim navigation ────────────────
@@ -570,14 +584,6 @@ func (p Pane) Update(msg tea.Msg) (Pane, tea.Cmd) {
 			case "G":
 				p.pendingG = false
 				p.goToLastRow()
-
-			// Search
-			case "/":
-				p.searchMode = true
-				p.searchQuery = ""
-				return p, nil
-			case "n":
-				p.nextSearchMatch()
 
 			// Tab switching
 			case "c":
@@ -1317,14 +1323,7 @@ func (p *Pane) nextSearchMatch() {
 // jumpToRow sets the table selection to the given row index and
 // scrolls it into view.
 func (p *Pane) jumpToRow(idx int) {
-	if idx < 0 || idx >= p.table.RowCount() {
-		return
-	}
-	// Move to first row, then step to target
-	p.table.SelectFirst()
-	for i := 0; i < idx; i++ {
-		p.table.MoveSelection(1)
-	}
+	p.table.SelectRow(idx)
 }
 
 // goToLastRow moves the selection to the last row in the table.
@@ -1370,4 +1369,19 @@ func (p *Pane) SetContainerImageSize(name, size string) {
 			}
 		}
 	}
+}
+
+// runningContainerNames returns the names of all running containers
+// from the current groups list.  Used to pass only relevant targets
+// to the stats fetcher, avoiding a redundant ContainerList API call.
+func (p Pane) runningContainerNames() []string {
+	var names []string
+	for _, g := range p.groups {
+		for _, c := range g.Containers {
+			if c.State == "running" || c.State == "healthy" {
+				names = append(names, c.Name)
+			}
+		}
+	}
+	return names
 }

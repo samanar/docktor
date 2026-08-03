@@ -19,7 +19,10 @@ type Client interface {
 	FollowLogs(ctx context.Context, containerName string) (<-chan string, error)
 
 	// ── Stats ────────────────────────────────────────
-	GetStats(ctx context.Context) (map[string]ContainerStats, error)
+	// GetStats fetches live resource stats for the given container
+	// names.  Only running containers should be passed — stopped
+	// containers will fail and be skipped.
+	GetStats(ctx context.Context, names []string) (map[string]ContainerStats, error)
 
 	// ── Images ───────────────────────────────────────
 	ListImages(ctx context.Context) ([]Image, error)

@@ -186,73 +186,111 @@ func (c *sdkClient) FollowLogs(ctx context.Context, containerName string) (<-cha
 
 // ── Stats ──────────────────────────────────────────────────────────
 
-func (c *sdkClient) GetStats(ctx context.Context) (map[string]ContainerStats, error) {
-	ctrs, err := c.cli.ContainerList(ctx, container.ListOptions{})
+func (c *sdkClient) GetStats(ctx context.Context, names []string) (map[string]ContainerStats, error) {
+	if len(names) == 0 {
+		return map[string]ContainerStats{}, nil
+	}
+
+	// Resolve container names to IDs with a single, filtered API call.
+	// We pass names explicitly to avoid listing ALL containers every tick.
+	args := filters.NewArgs(filters.Arg("status", "running"))
+	for _, n := range names {
+		args.Add("name", n)
+	}
+	ctrs, err := c.cli.ContainerList(ctx, container.ListOptions{
+		All:     false,
+		Filters: args,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
 
-	result := make(map[string]ContainerStats, len(ctrs))
+	if len(ctrs) == 0 {
+		return map[string]ContainerStats{}, nil
+	}
+
+	// Fetch stats for all containers concurrently.
+	type statResult struct {
+		name  string
+		stats ContainerStats
+	}
+	ch := make(chan statResult, len(ctrs))
+
 	for _, ctr := range ctrs {
-		name := strings.TrimPrefix(ctr.Names[0], "/")
+		go func(id string, containerName string) {
+			cs := ContainerStats{Name: containerName}
+			resp, err := c.cli.ContainerStats(ctx, id, false)
+			if err != nil {
+				ch <- statResult{name: containerName, stats: cs}
+				return
+			}
 
-		resp, err := c.cli.ContainerStats(ctx, ctr.ID, false)
-		if err != nil {
-			continue
-		}
-
-		var stats container.StatsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+			var stats container.StatsResponse
+			if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+				resp.Body.Close()
+				ch <- statResult{name: containerName, stats: cs}
+				return
+			}
 			resp.Body.Close()
-			continue
-		}
-		resp.Body.Close()
 
-		cs := ContainerStats{Name: name}
-
-		// CPU %
-		if prevCPU := stats.PreCPUStats.CPUUsage.TotalUsage; prevCPU > 0 {
-			cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage - prevCPU)
-			sysDelta := float64(stats.CPUStats.SystemUsage - stats.PreCPUStats.SystemUsage)
-			if sysDelta > 0 {
-				cs.CPUPerc = fmt.Sprintf("%.2f%%", (cpuDelta/sysDelta)*float64(stats.CPUStats.OnlineCPUs)*100)
+			// CPU %
+			if prevCPU := stats.PreCPUStats.CPUUsage.TotalUsage; prevCPU > 0 {
+				cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage - prevCPU)
+				sysDelta := float64(stats.CPUStats.SystemUsage - stats.PreCPUStats.SystemUsage)
+				if sysDelta > 0 {
+					cs.CPUPerc = fmt.Sprintf("%.2f%%", (cpuDelta/sysDelta)*float64(stats.CPUStats.OnlineCPUs)*100)
+				}
 			}
-		}
 
-		// Memory
-		if stats.MemoryStats.Usage > 0 {
-			cs.MemUsage = fmt.Sprintf("%s / %s",
-				units.BytesSize(float64(stats.MemoryStats.Usage)),
-				units.BytesSize(float64(stats.MemoryStats.Limit)),
+			// Memory
+			if stats.MemoryStats.Usage > 0 {
+				cs.MemUsage = fmt.Sprintf("%s / %s",
+					units.BytesSize(float64(stats.MemoryStats.Usage)),
+					units.BytesSize(float64(stats.MemoryStats.Limit)),
+				)
+				if stats.MemoryStats.Limit > 0 {
+					cs.MemPerc = fmt.Sprintf("%.2f%%",
+						float64(stats.MemoryStats.Usage)/float64(stats.MemoryStats.Limit)*100)
+				}
+			}
+
+			// Network I/O
+			var rx, tx uint64
+			for _, net := range stats.Networks {
+				rx += net.RxBytes
+				tx += net.TxBytes
+			}
+			cs.NetIO = fmt.Sprintf("%s / %s", units.BytesSize(float64(rx)), units.BytesSize(float64(tx)))
+
+			// Block I/O
+			var readBytes, writeBytes uint64
+			if len(stats.BlkioStats.IoServiceBytesRecursive) > 0 {
+				readBytes = stats.BlkioStats.IoServiceBytesRecursive[0].Value
+			}
+			if len(stats.BlkioStats.IoServiceBytesRecursive) > 1 {
+				writeBytes = stats.BlkioStats.IoServiceBytesRecursive[1].Value
+			}
+			cs.BlockIO = fmt.Sprintf("%s / %s",
+				units.BytesSize(float64(readBytes)),
+				units.BytesSize(float64(writeBytes)),
 			)
-			if stats.MemoryStats.Limit > 0 {
-				cs.MemPerc = fmt.Sprintf("%.2f%%",
-					float64(stats.MemoryStats.Usage)/float64(stats.MemoryStats.Limit)*100)
-			}
-		}
 
-		// Network I/O
-		var rx, tx uint64
-		for _, net := range stats.Networks {
-			rx += net.RxBytes
-			tx += net.TxBytes
-		}
-		cs.NetIO = fmt.Sprintf("%s / %s", units.BytesSize(float64(rx)), units.BytesSize(float64(tx)))
+			ch <- statResult{name: containerName, stats: cs}
+		}(ctr.ID, strings.TrimPrefix(ctr.Names[0], "/"))
+	}
 
-		// Block I/O (defensive — slice may be empty or have only one entry).
-		var readBytes, writeBytes uint64
-		if len(stats.BlkioStats.IoServiceBytesRecursive) > 0 {
-			readBytes = stats.BlkioStats.IoServiceBytesRecursive[0].Value
+	// Collect results with a timeout.
+	result := make(map[string]ContainerStats, len(ctrs))
+	deadline := time.After(3 * time.Second)
+	for i := 0; i < len(ctrs); i++ {
+		select {
+		case r := <-ch:
+			result[r.name] = r.stats
+		case <-deadline:
+			return result, nil
+		case <-ctx.Done():
+			return result, ctx.Err()
 		}
-		if len(stats.BlkioStats.IoServiceBytesRecursive) > 1 {
-			writeBytes = stats.BlkioStats.IoServiceBytesRecursive[1].Value
-		}
-		cs.BlockIO = fmt.Sprintf("%s / %s",
-			units.BytesSize(float64(readBytes)),
-			units.BytesSize(float64(writeBytes)),
-		)
-
-		result[name] = cs
 	}
 
 	return result, nil

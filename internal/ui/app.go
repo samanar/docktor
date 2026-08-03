@@ -65,6 +65,12 @@ type AppModel struct {
 	bulkSpinnerIdx    int
 	bulkActionResult  string
 	bulkActionErr     error
+
+	// ── Sparkline history ───────────────────────────
+	cpuHistory      map[string]*sparklineHistory // container name → CPU history
+	memHistory      map[string]*sparklineHistory // container name → memory history
+	groupCPUHistory map[string]*sparklineHistory // group project → aggregate CPU
+	groupMemHistory map[string]*sparklineHistory // group project → aggregate memory
 }
 
 // NewApp creates the root application model with the given theme.
@@ -74,11 +80,15 @@ func NewApp(theme Theme) (AppModel, error) {
 		return AppModel{}, fmt.Errorf("docker client: %w", err)
 	}
 	return AppModel{
-		theme:         theme,
-		pane:          NewPane(theme, dc),
-		dc:            dc,
-		focus:         1,
-		logAutoScroll: true,
+		theme:           theme,
+		pane:            NewPane(theme, dc),
+		dc:              dc,
+		focus:           1,
+		logAutoScroll:   true,
+		cpuHistory:      make(map[string]*sparklineHistory),
+		memHistory:      make(map[string]*sparklineHistory),
+		groupCPUHistory: make(map[string]*sparklineHistory),
+		groupMemHistory: make(map[string]*sparklineHistory),
 	}, nil
 }
 
@@ -278,6 +288,13 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh containers after bulk action
 		return m, m.pane.Init()
 
+	// ── Stats refreshed (record sparkline history) ──
+	case statsRefreshMsg:
+		if msg.err == nil {
+			m.recordSparklineHistory(m.pane.groups, msg.stats)
+		}
+		return m.handleSelectionChanges(m.pane.Update(msg))
+
 	// ── Mouse ────────────────────────────────────────
 	case tea.MouseMsg:
 		if msg.Action != tea.MouseActionPress {
@@ -418,9 +435,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── Pane navigation (focus 1) ─────────────────
 		if m.focus == 1 {
 			// Enter on a data row (not a group header) should
-			// move focus to the logs / detail pane.
+			// move focus to the logs / detail pane — UNLESS the
+			// pane is in search mode, in which case Enter
+			// submits the search query.
 			isEnter := msg.Type == tea.KeyEnter
-			if isEnter {
+			if isEnter && !m.pane.searchMode {
 				if m.pane.SelectedContainer() != "" ||
 					m.pane.SelectedImage() != "" ||
 					m.pane.SelectedVolume() != "" ||

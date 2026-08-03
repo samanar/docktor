@@ -13,7 +13,6 @@ Built with [Go](https://go.dev), [Bubble Tea](https://github.com/charmbracelet/b
 
 ## Features
 
-- **Three-pane layout** — Navigator, overview, and detail panel visible at once
 - **Compose-aware** — Automatically groups containers by Docker Compose project; collapse/expand groups with a single key
 - **Real-time stats** — Live CPU, memory, network I/O, and disk I/O per container, refreshed every second
 - **Vim-style navigation** — `j`/`k`, `gg`/`G`, `Ctrl+d`/`Ctrl+u`, `/` search with `n` for next match
@@ -25,6 +24,7 @@ Built with [Go](https://go.dev), [Bubble Tea](https://github.com/charmbracelet/b
 - **Network inspection** — View full network details including subnet, gateway, and attached containers
 - **Compose commands** — Run `docker compose up/down/pull/build/restart` directly from the TUI
 - **Bulk actions** — Stop all containers, remove all containers, or prune exited containers in one step
+- **Three-pane layout** — Navigator, overview, and detail panel visible at once
 - **Mouse support** — Click to focus panes and select items
 
 ---

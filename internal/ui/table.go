@@ -299,6 +299,24 @@ func (t *Table) SelectFirst() {
 	}
 }
 
+// SelectRow directly sets the selection to the given absolute row
+// index and scrolls it into view.  Separator rows are skipped
+// downward to the next selectable row.
+func (t *Table) SelectRow(idx int) {
+	if idx < 0 || idx >= len(t.rows) {
+		return
+	}
+	// Skip separators — they are not selectable.
+	for idx < len(t.rows) && t.rows[idx].Type == RowSeparator {
+		idx++
+	}
+	if idx >= len(t.rows) {
+		return
+	}
+	t.selected = idx
+	t.scrollToVisible()
+}
+
 // ClickAt selects the row at the given Y position within the table
 // viewport.  Y=0 is the header line, Y=1 is the divider, Y>=2 are
 // data rows.  Returns true if a selectable row was clicked.
