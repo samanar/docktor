@@ -79,7 +79,7 @@ make run
 ├───────────────────────────────┴──────────────────────┤
 │                                                      │
 │                   Detail Panel                       │
-│              (logs / layers / file usage)             │
+│           (logs / layers / file usage)               │
 │                                                      │
 └──────────────────────────────────────────────────────┘
 ```
@@ -88,50 +88,53 @@ make run
 
 #### Navigator pane (focus `1`)
 
-| Key                     | Action                                           |
-| ----------------------- | ------------------------------------------------ |
-| `j` / `↓`              | Move down                                        |
-| `k` / `↑`              | Move up                                          |
-| `g` `g`                | Go to first row                                  |
-| `G`                    | Go to last row                                   |
-| `Ctrl+d`               | Half-page down                                   |
-| `Ctrl+u`               | Half-page up                                     |
-| `Space`                | Toggle group collapse / expand                   |
-| `/`                    | Search containers by name                        |
-| `n`                    | Next search match                                |
-| `Enter`                | Select item (view logs, layers, or details)      |
-| `s`                    | Start container                                  |
-| `x`                    | Stop container                                   |
-| `r`                    | Restart container                                |
-| `K`                    | Kill container                                   |
-| `u`                    | Compose up (on a Compose group)                  |
-| `d`                    | Compose down (on a Compose group)                |
-| `p`                    | Compose pull (on a Compose group)                |
-| `b`                    | Bulk actions dialog                              |
+
+| Key                   | Action                                                |
+| ----------------------- | ------------------------------------------------------- |
+| `j` / `↓`            | Move down                                             |
+| `k` / `↑`            | Move up                                               |
+| `g` `g`               | Go to first row                                       |
+| `G`                   | Go to last row                                        |
+| `Ctrl+d`              | Half-page down                                        |
+| `Ctrl+u`              | Half-page up                                          |
+| `Space`               | Toggle group collapse / expand                        |
+| `/`                   | Search containers by name                             |
+| `n`                   | Next search match                                     |
+| `Enter`               | Select item (view logs, layers, or details)           |
+| `s`                   | Start container                                       |
+| `x`                   | Stop container                                        |
+| `r`                   | Restart container                                     |
+| `K`                   | Kill container                                        |
+| `u`                   | Compose up (on a Compose group)                       |
+| `d`                   | Compose down (on a Compose group)                     |
+| `p`                   | Compose pull (on a Compose group)                     |
+| `b`                   | Bulk actions dialog                                   |
 | `c` / `i` / `v` / `N` | Switch tabs: Containers / Images / Volumes / Networks |
-| `q`                    | Quit                                             |
+| `q`                   | Quit                                                  |
 
 #### Log / detail viewer (focus `3`)
 
-| Key            | Action                            |
-| -------------- | --------------------------------- |
-| `j` / `↓`     | Scroll down                       |
-| `k` / `↑`     | Scroll up                         |
-| `g`            | Go to top                         |
-| `G`            | Go to bottom                      |
-| `Ctrl+d`       | Half-page down                    |
-| `Ctrl+u`       | Half-page up                      |
-| `f`            | Toggle follow mode (stream logs)  |
-| `/`            | Search within logs                |
-| `n`            | Next log search match             |
+
+| Key        | Action                           |
+| ------------ | ---------------------------------- |
+| `j` / `↓` | Scroll down                      |
+| `k` / `↑` | Scroll up                        |
+| `g`        | Go to top                        |
+| `G`        | Go to bottom                     |
+| `Ctrl+d`   | Half-page down                   |
+| `Ctrl+u`   | Half-page up                     |
+| `f`        | Toggle follow mode (stream logs) |
+| `/`        | Search within logs               |
+| `n`        | Next log search match            |
 
 #### Global
 
-| Key                       | Action                            |
-| ------------------------- | --------------------------------- |
-| `1` / `2` / `3`           | Focus navigator / overview / logs |
-| `Tab`                     | Cycle focus                       |
-| `q` / `Esc` / `Ctrl+c`   | Quit                              |
+
+| Key                    | Action                            |
+| ------------------------ | ----------------------------------- |
+| `1` / `2` / `3`        | Focus navigator / overview / logs |
+| `Tab`                  | Cycle focus                       |
+| `q` / `Esc` / `Ctrl+c` | Quit                              |
 
 ---
 
@@ -180,6 +183,7 @@ docktor/
 ```
 
 The project follows a clean separation of concerns:
+
 - **`docker/`** — Abstracts all Docker daemon communication behind a `Client` interface, making it testable and swappable.
 - **`ui/`** — Pure Bubble Tea model with no Docker logic; it only calls the `Client` interface. All rendering is driven by the `Theme` struct for easy customization.
 
@@ -187,12 +191,13 @@ The project follows a clean separation of concerns:
 
 ## Tech stack
 
-| Component        | Library                                                    |
-| ---------------- | ---------------------------------------------------------- |
-| Language         | [Go](https://go.dev)                                       |
-| TUI framework    | [Bubble Tea](https://github.com/charmbracelet/bubbletea)   |
-| Styling          | [Lip Gloss](https://github.com/charmbracelet/lipgloss)     |
-| Docker API       | [Docker Engine API SDK](https://pkg.go.dev/github.com/docker/docker/client) |
+
+| Component     | Library                                                                     |
+| --------------- | ----------------------------------------------------------------------------- |
+| Language      | [Go](https://go.dev)                                                        |
+| TUI framework | [Bubble Tea](https://github.com/charmbracelet/bubbletea)                    |
+| Styling       | [Lip Gloss](https://github.com/charmbracelet/lipgloss)                      |
+| Docker API    | [Docker Engine API SDK](https://pkg.go.dev/github.com/docker/docker/client) |
 
 ---
 
